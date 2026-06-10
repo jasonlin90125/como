@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "como"
+version = "0.1.0"
+description = "COMO/DeepCOMO: Compound Optimization Monitor for analog series analysis"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "rdkit",
+    "polars",
+    "networkx",
+]
+
+[project.scripts]
+como = "como.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["como*"]
+
+[tool.setuptools.package-data]
+"como.analogs" = ["fragments.smi"]

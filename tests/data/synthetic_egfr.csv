@@ -1,0 +1,10 @@
+smiles,pActivity
+COc1cc2ncnc(Nc3ccccc3)c2cc1OC,7.2
+COc1cc2ncnc(Nc3ccc(F)cc3)c2cc1OC,7.8
+COc1cc2ncnc(Nc3ccc(Cl)cc3)c2cc1OC,7.5
+CCOc1cc2ncnc(Nc3ccccc3)c2cc1OCC,6.9
+CCOc1cc2ncnc(Nc3ccc(F)cc3)c2cc1OCC,7.4
+CCOc1cc2ncnc(Nc3ccc(Cl)cc3)c2cc1OCC,7.1
+Cc1cc2ncnc(Nc3ccccc3)c2cc1C,6.5
+Cc1cc2ncnc(Nc3ccc(F)cc3)c2cc1C,7.0
+Cc1cc2ncnc(Nc3ccc(Cl)cc3)c2cc1C,6.7
