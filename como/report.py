@@ -40,6 +40,12 @@ class ComoResult:
     fw_n_sites: int
     fw_n_unique_substituents: int
 
+    # FW per-candidate prediction details (smiles -> mean/std/n)
+    fw_pred_std: dict[str, float] = field(default_factory=dict)
+    fw_pred_n: dict[str, int] = field(default_factory=dict)
+    # Retrospective FW EA predictions {smiles: [pred, ...]}
+    fw_ea_predictions: dict[str, list[float]] = field(default_factory=dict)
+
     # Descriptor info
     descriptor_names: tuple[str, ...] = field(default=DESCRIPTOR_NAMES)
     scaler: object = field(default=None, repr=False)
@@ -124,6 +130,89 @@ def _percentile_rank_static(
         if not np.isnan(pred):
             result[i] = 100.0 * float((ea_activities < pred).mean())
     return result
+
+
+def write_fw_predictions_csv(result: ComoResult, path: Path) -> None:
+    """Write fw_predictions.csv with per-entry FW prediction details.
+
+    Columns: smiles, type (fw_va|fw_ea), fw_pred_mean, fw_pred_std, fw_pred_n,
+             observed_activity, abs_error
+    """
+    rows = []
+
+    # FW VA candidates
+    act_lookup = dict(zip(result.ea_smiles, result.ea_activities.tolist()))
+    va_df = result.va_df
+    fw_pred_lookup = {}
+    if len(va_df) > 0 and "fw_pred_pActivity" in va_df.columns:
+        for row in va_df.iter_rows(named=True):
+            smi = row["smiles"]
+            val = row.get("fw_pred_pActivity")
+            if val is not None and not (isinstance(val, float) and val != val):
+                fw_pred_lookup[smi] = val
+
+    for smi, pred_mean in sorted(result.va_df.filter(
+        result.va_df["source_strategy"] == "free_wilson"
+    )["smiles"].to_list() if len(result.va_df) > 0 else []):
+        pass  # handled below via fw_pred_lookup
+
+    # Write FW VA rows
+    fw_va_smiles = set()
+    if len(result.va_df) > 0:
+        fw_rows_df = result.va_df.filter(result.va_df["source_strategy"] == "free_wilson")
+        fw_va_smiles = set(fw_rows_df["smiles"].to_list())
+
+    for smi in sorted(fw_va_smiles):
+        pred_mean = fw_pred_lookup.get(smi, float("nan"))
+        pred_std = result.fw_pred_std.get(smi, 0.0)
+        pred_n = result.fw_pred_n.get(smi, 1)
+        rows.append({
+            "smiles": smi,
+            "type": "fw_va",
+            "fw_pred_mean": pred_mean,
+            "fw_pred_std": pred_std,
+            "fw_pred_n": pred_n,
+            "observed_activity": float("nan"),
+            "abs_error": float("nan"),
+        })
+
+    # Write retrospective FW EA rows
+    for smi, preds in sorted(result.fw_ea_predictions.items()):
+        mean_pred = float(np.mean(preds))
+        std_pred = float(np.std(preds)) if len(preds) > 1 else 0.0
+        obs = act_lookup.get(smi, float("nan"))
+        abs_err = abs(mean_pred - obs) if not (obs != obs) else float("nan")
+        rows.append({
+            "smiles": smi,
+            "type": "fw_ea",
+            "fw_pred_mean": mean_pred,
+            "fw_pred_std": std_pred,
+            "fw_pred_n": len(preds),
+            "observed_activity": obs,
+            "abs_error": abs_err,
+        })
+
+    if not rows:
+        pl.DataFrame(schema={
+            "smiles": pl.Utf8,
+            "type": pl.Utf8,
+            "fw_pred_mean": pl.Float64,
+            "fw_pred_std": pl.Float64,
+            "fw_pred_n": pl.Int64,
+            "observed_activity": pl.Float64,
+            "abs_error": pl.Float64,
+        }).write_csv(path)
+        return
+
+    pl.DataFrame(rows, schema={
+        "smiles": pl.Utf8,
+        "type": pl.Utf8,
+        "fw_pred_mean": pl.Float64,
+        "fw_pred_std": pl.Float64,
+        "fw_pred_n": pl.Int64,
+        "observed_activity": pl.Float64,
+        "abs_error": pl.Float64,
+    }).write_csv(path)
 
 
 def write_scores_csv(result: ComoResult, path: Path) -> None:

@@ -16,7 +16,7 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from .descriptors import compute_descriptors, normalize_descriptors
 from .nbh import build_nbh
 from .potency import SVRPredictor
-from .report import ComoResult, build_va_dataframe, write_scores_csv, write_summary_txt
+from .report import ComoResult, build_va_dataframe, write_fw_predictions_csv, write_scores_csv, write_summary_txt
 
 if TYPE_CHECKING:
     from .analogs.base import VAGenerator
@@ -275,6 +275,9 @@ class ComoAnalysis:
         fw_n_ea_in_nbh = fw_gen.n_ea_in_fw_nbh if fw_gen is not None else 0
         fw_n_sites = fw_gen.n_sites if fw_gen is not None else 0
         fw_n_unique_substituents = fw_gen.n_unique_substituents if fw_gen is not None else 0
+        fw_pred_std = fw_gen.fw_pred_std if fw_gen is not None else {}
+        fw_pred_n = fw_gen.fw_pred_n if fw_gen is not None else {}
+        fw_ea_predictions = fw_gen.fw_ea_predictions if fw_gen is not None else {}
 
         n_ea_total = getattr(self, "_n_ea_with_core", len(ea_smiles))
         fw_pct = f"{100 * fw_n_ea_in_nbh / n_ea_total:.1f}%" if n_ea_total > 0 else "N/A"
@@ -303,6 +306,9 @@ class ComoAnalysis:
             fw_n_ea_in_nbh=fw_n_ea_in_nbh,
             fw_n_sites=fw_n_sites,
             fw_n_unique_substituents=fw_n_unique_substituents,
+            fw_pred_std=fw_pred_std,
+            fw_pred_n=fw_pred_n,
+            fw_ea_predictions=fw_ea_predictions,
             scaler=scaler,
         )
         return result
@@ -328,6 +334,8 @@ def score_series(
     svr_c: float = 10.0,
     svr_epsilon: float = 0.1,
     fragment_lib: str | Path | None = None,
+    paper_mode: bool = False,
+    random_state: int = 42,
 ) -> ComoResult:
     """Run the full COMO pipeline on an analog series.
 
@@ -410,7 +418,7 @@ def score_series(
     strategy_set = set(va_strategies)
 
     if "close_in" in strategy_set:
-        generators.append(CloseInVAGenerator())
+        generators.append(CloseInVAGenerator(paper_mode=paper_mode, random_state=random_state))
     if "diverse" in strategy_set:
         generators.append(DiverseVAGenerator(fragment_lib_path=fragment_lib))
     if "free_wilson" in strategy_set:
@@ -441,6 +449,7 @@ def score_series(
     write_scores_csv(result, output_path / "scores.csv")
     result.va_df.write_csv(output_path / "va_populations.csv")
     write_summary_txt(result, output_path / "summary.txt")
+    write_fw_predictions_csv(result, output_path / "fw_predictions.csv")
 
     print(
         f"[COMO] C={result.C:.3f}  D={result.D:.3f}  S={result.S:.3f}  "
@@ -448,3 +457,151 @@ def score_series(
     )
     print(f"[COMO] Results written to {output_path}/")
     return result
+
+
+# ---------------------------------------------------------------------------
+# score_with_repeats — paper-aligned diagnostic scoring protocol
+# ---------------------------------------------------------------------------
+
+def score_with_repeats(
+    series_csv: str | Path | pl.DataFrame,
+    smiles_col: str = "smiles",
+    activity_col: str = "pActivity",
+    core: str | None = None,
+    n_va: int = 1000,
+    n_repeats: int = 10,
+    nbh_radius: float | None = None,
+    random_state: int = 42,
+    s_threshold: float = 0.4,
+    p_threshold: float = 0.5,
+    paper_mode: bool = True,
+) -> dict:
+    """Run the COMO diagnostic scoring protocol with multiple random repeats.
+
+    Generates n_va close-in VAs per repeat (paper-mode random sampling) and
+    computes C, D, S, P for each.  Reports mean and std over n_repeats.
+
+    Parameters
+    ----------
+    paper_mode:
+        When True (default), uses CloseInVAGenerator(paper_mode=True) with
+        H-aware random sampling.  When False, uses legacy deterministic mode
+        (all repeats will be identical).
+    random_state:
+        Base seed.  Each repeat uses random_state + repeat_index.
+
+    Returns
+    -------
+    dict with keys:
+        'repeats': list of dicts, one per repeat (C, D, S, P, stage)
+        'C_mean', 'C_std', 'D_mean', 'D_std', 'S_mean', 'S_std',
+        'P_mean', 'P_std'
+        'settings': dict of all settings used
+    """
+    from .analogs.close_in import CloseInVAGenerator
+
+    # --- Load data ---
+    if isinstance(series_csv, pl.DataFrame):
+        df_raw = series_csv
+    else:
+        df_raw = pl.read_csv(series_csv)
+
+    df = df_raw.drop_nulls(subset=[smiles_col, activity_col])
+    ea_smiles = df[smiles_col].to_list()
+    ea_activities = np.array(df[activity_col].to_list(), dtype=np.float64)
+
+    if len(ea_smiles) < 3:
+        raise ValueError(f"Need at least 3 EAs, got {len(ea_smiles)}.")
+
+    # Auto-detect core if not provided
+    if core is None:
+        core = detect_murcko_core(ea_smiles)
+        if core:
+            print(f"[COMO] Auto-detected core: {core}")
+
+    # Compute EA HAC range for VA size filter
+    ea_hacs = [
+        m.GetNumHeavyAtoms()
+        for s in ea_smiles
+        if (m := Chem.MolFromSmiles(s)) is not None
+    ]
+    ea_hac_range = (min(ea_hacs) - 3, max(ea_hacs) + 3) if ea_hacs else (0, 100)
+
+    # Compute EA descriptors (same for all repeats)
+    ea_raw, ea_valid_idx = compute_descriptors(ea_smiles)
+    ea_activities_aligned = ea_activities[ea_valid_idx]
+
+    repeat_results = []
+
+    for rep in range(n_repeats):
+        seed = random_state + rep
+        gen = CloseInVAGenerator(
+            paper_mode=paper_mode,
+            random_state=seed,
+        )
+        va_smiles = gen.generate(ea_smiles, ea_activities, core, n_va, ea_hac_range)
+
+        if not va_smiles:
+            repeat_results.append({"repeat": rep, "C": 0.0, "D": 0.0, "S": 0.0, "P": 0.0, "stage": "early", "n_va": 0})
+            continue
+
+        va_raw, va_valid_idx = compute_descriptors(va_smiles)
+        _, va_norm, _ = normalize_descriptors(ea_raw, va_raw)
+        ea_norm, _, _ = normalize_descriptors(ea_raw, va_raw)
+
+        membership, _ = build_nbh(ea_norm, va_norm, r=nbh_radius)
+
+        C = c_score(membership)
+        D, _ = d_score(membership)
+        S = s_score(C, D)
+        P = p_score(membership, ea_activities_aligned)
+        stage = assign_stage(S, P, s_threshold, p_threshold)
+
+        repeat_results.append({
+            "repeat": rep,
+            "C": C,
+            "D": D,
+            "S": S,
+            "P": P,
+            "stage": stage,
+            "n_va": len(va_smiles),
+        })
+        print(
+            f"[COMO] Repeat {rep + 1:2d}/{n_repeats}  "
+            f"C={C:.3f}  D={D:.3f}  S={S:.3f}  P={P:.3f}  "
+            f"stage={stage}  n_va={len(va_smiles)}"
+        )
+
+    Cs = [r["C"] for r in repeat_results]
+    Ds = [r["D"] for r in repeat_results]
+    Ss = [r["S"] for r in repeat_results]
+    Ps = [r["P"] for r in repeat_results]
+
+    summary = {
+        "repeats": repeat_results,
+        "C_mean": float(np.mean(Cs)),
+        "C_std": float(np.std(Cs)),
+        "D_mean": float(np.mean(Ds)),
+        "D_std": float(np.std(Ds)),
+        "S_mean": float(np.mean(Ss)),
+        "S_std": float(np.std(Ss)),
+        "P_mean": float(np.mean(Ps)),
+        "P_std": float(np.std(Ps)),
+        "settings": {
+            "n_va": n_va,
+            "n_repeats": n_repeats,
+            "nbh_radius": nbh_radius,
+            "random_state": random_state,
+            "paper_mode": paper_mode,
+            "s_threshold": s_threshold,
+            "p_threshold": p_threshold,
+        },
+    }
+    print(
+        f"[COMO] Summary  "
+        f"C={summary['C_mean']:.3f}±{summary['C_std']:.3f}  "
+        f"D={summary['D_mean']:.3f}±{summary['D_std']:.3f}  "
+        f"S={summary['S_mean']:.3f}±{summary['S_std']:.3f}  "
+        f"P={summary['P_mean']:.3f}±{summary['P_std']:.3f}"
+    )
+    return summary

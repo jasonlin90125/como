@@ -10,6 +10,7 @@ from rdkit import Chem
 from rdkit.Chem import ReplaceCore, GetMolFrags, RWMol
 
 from .base import VAGenerator
+from ..series.assembly import _assemble_core_plus_frags
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +290,31 @@ def _canonical(smi: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 class CloseInVAGenerator(VAGenerator):
+    """Close-in VA generator with optional paper-mode random H-aware sampling.
+
+    paper_mode=False (default / legacy): deterministic Cartesian enumeration
+        over all fragment pools.  Every site must be filled; H / no-substituent
+        is not modelled.  First n valid products in sorted-fragment order.
+
+    paper_mode=True: random sampling weighted by the observed per-series
+        substitution probability.  Each site is either filled with a randomly
+        chosen organic fragment or left as H/no-substituent according to
+        p_sub.  Requires random_state for reproducibility.
+    """
+
     strategy_name = "close_in"
+
+    def __init__(
+        self,
+        paper_mode: bool = False,
+        random_state: int | None = None,
+        max_attempts: int = 1_000_000,
+        min_organic_substituents: int = 1,
+    ) -> None:
+        self.paper_mode = paper_mode
+        self.random_state = random_state
+        self.max_attempts = max_attempts
+        self.min_organic_substituents = min_organic_substituents
 
     def generate(
         self,
@@ -303,31 +328,43 @@ class CloseInVAGenerator(VAGenerator):
             warnings.warn("CloseInVAGenerator requires a core SMILES. Skipping.")
             return []
 
+        if self.paper_mode:
+            return self._generate_paper(ea_smiles, core_smiles, n, ea_hac_range)
+        else:
+            return self._generate_legacy(ea_smiles, core_smiles, n, ea_hac_range)
+
+    # ------------------------------------------------------------------
+    # Legacy path (unchanged deterministic Cartesian enumeration)
+    # ------------------------------------------------------------------
+
+    def _generate_legacy(
+        self,
+        ea_smiles: list[str],
+        core_smiles: str,
+        n: int,
+        ea_hac_range: tuple[int, int],
+    ) -> list[str]:
         core_mol, rows = _decompose_replacecore(core_smiles, ea_smiles)
         if core_mol is None or not rows:
             return []
 
-        # Identify all substitution sites (core atom indices present in ≥1 EA)
         all_sites: set[int] = set()
         for _, site_map in rows:
             all_sites.update(site_map.keys())
         site_list = sorted(all_sites)
-
         if not site_list:
             return []
 
-        # Build per-site pools from observed EA fragments
         pools: dict[int, set[str]] = {s: set() for s in site_list}
         for _, site_map in rows:
             for site, frag_smi in site_map.items():
-                pools[site].add(frag_smi)
+                if frag_smi is not None:
+                    pools[site].add(frag_smi)
 
         ea_set = {c for s in ea_smiles if (c := _canonical(s)) is not None}
         min_hac, max_hac = ea_hac_range
-
         results: list[str] = []
         seen: set[str] = set()
-
         pool_lists = [sorted(pools[s]) for s in site_list]
 
         for combo in itertools.product(*pool_lists):
@@ -348,5 +385,66 @@ class CloseInVAGenerator(VAGenerator):
             results.append(canon)
             if len(results) >= n:
                 break
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Paper-mode path (random H-aware sampling)
+    # ------------------------------------------------------------------
+
+    def _generate_paper(
+        self,
+        ea_smiles: list[str],
+        core_smiles: str,
+        n: int,
+        ea_hac_range: tuple[int, int],
+    ) -> list[str]:
+        from ..series.decomposition import decompose_series
+        from ..series.assembly import assemble_series_member
+
+        decomp = decompose_series(
+            core_smiles, ea_smiles, paper_mode=True,
+        )
+        if not decomp.ea_records or not decomp.site_list:
+            return []
+
+        rng = np.random.default_rng(self.random_state)
+        p_sub = decomp.substitution_probability
+        site_list = decomp.site_list
+        pool_arrays = {s: sorted(decomp.site_pools[s]) for s in site_list}
+        ea_set = decomp.ea_canonical_set
+        min_hac, max_hac = ea_hac_range
+
+        results: list[str] = []
+        seen: set[str] = set()
+        attempts = 0
+
+        while len(results) < n and attempts < self.max_attempts:
+            attempts += 1
+            site_map: dict[int, str | None] = {}
+            for s in site_list:
+                pool = pool_arrays[s]
+                if pool and rng.random() < p_sub:
+                    site_map[s] = pool[int(rng.integers(len(pool)))]
+                else:
+                    site_map[s] = None
+
+            organic_count = sum(1 for v in site_map.values() if v is not None)
+            if organic_count < self.min_organic_substituents:
+                continue
+
+            smi = assemble_series_member(decomp, site_map)
+            if smi is None:
+                continue
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            hac = mol.GetNumHeavyAtoms()
+            if hac < min_hac or hac > max_hac:
+                continue
+            if smi in seen or smi in ea_set:
+                continue
+            seen.add(smi)
+            results.append(smi)
 
         return results

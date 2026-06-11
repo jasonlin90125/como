@@ -22,13 +22,15 @@ _EAS_1R = [
 ]
 _ACTS_1R = np.array([6.0, 6.3, 5.8, 6.1, 5.9])
 
-# 3x2 grid scaffold for FW tests (quinazoline-like, 2 substitution sites)
-_CORE_2R = "c1cc2ncncc2cc1"  # quinazoline
+# 2-site scaffold for FW tests: N-substituted para-substituted anilines
+# site 0 = N-alkyl, site 4 = para-halogen
+# Missing corner: N-Et + Cl (FW VA candidate, pred = 7.8 + 6.9 - 7.2 = 7.5)
+_CORE_2R = "Nc1ccccc1"  # aniline
 _EAS_2R = [
-    ("COc1cc2ncnc(Nc3ccccc3)c2cc1OC", 7.2),   # R1=OMe, R2=Ph
-    ("COc1cc2ncnc(Nc3ccc(F)cc3)c2cc1OC", 7.8),  # R1=OMe, R2=p-F-Ph
-    ("CCOc1cc2ncnc(Nc3ccccc3)c2cc1OCC", 6.9),  # R1=OEt, R2=Ph
-    # R1=OEt, R2=p-F-Ph is intentionally MISSING (FW VA candidate)
+    ("CNc1ccc(F)cc1", 7.2),    # R1=Me, R2=F
+    ("CNc1ccc(Cl)cc1", 7.8),   # R1=Me, R2=Cl
+    ("CCNc1ccc(F)cc1", 6.9),   # R1=Et, R2=F
+    # R1=Et, R2=Cl is intentionally MISSING (FW VA candidate)
 ]
 _SMILES_2R = [row[0] for row in _EAS_2R]
 _ACTS_2R = np.array([row[1] for row in _EAS_2R])
