@@ -151,11 +151,6 @@ def write_fw_predictions_csv(result: ComoResult, path: Path) -> None:
             if val is not None and not (isinstance(val, float) and val != val):
                 fw_pred_lookup[smi] = val
 
-    for smi, pred_mean in sorted(result.va_df.filter(
-        result.va_df["source_strategy"] == "free_wilson"
-    )["smiles"].to_list() if len(result.va_df) > 0 else []):
-        pass  # handled below via fw_pred_lookup
-
     # Write FW VA rows
     fw_va_smiles = set()
     if len(result.va_df) > 0:
