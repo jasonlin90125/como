@@ -1,8 +1,7 @@
-"""Close-in VA generator: enumerate substituent combinations observed in EAs."""
+"""Close-in VA generator: H-aware random sampling over EA-derived substituents."""
 
 from __future__ import annotations
 
-import itertools
 import warnings
 
 import numpy as np
@@ -51,16 +50,7 @@ def _prep_fragment(frag_mol: Chem.Mol) -> tuple[str | None, int]:
 
 
 def _has_fused_match(mol: Chem.Mol, core_mol: Chem.Mol) -> bool:
-    """Return True if every match of core_mol onto mol cuts at least one ring bond.
-
-    Uses the same SMARTS-style matching that ReplaceCore uses internally.
-    A cut bond is one where exactly one endpoint is in the core match; it is a
-    ring bond if it appears in the molecule's SSSR bond list.  If all matches
-    cut a ring bond the molecule cannot be cleanly R-group decomposed with this
-    core — the caller should skip it and report.
-    """
-    # ReplaceCore matches with useChirality=False, useQueryQueryMatches=False;
-    # replicate that here so we see the same matches it would use.
+    """Return True if every match of core_mol onto mol cuts at least one ring bond."""
     core_query = Chem.MolFromSmarts(Chem.MolToSmarts(core_mol))
     if core_query is None:
         core_query = core_mol
@@ -72,7 +62,7 @@ def _has_fused_match(mol: Chem.Mol, core_mol: Chem.Mol) -> bool:
 
     matches = mol.GetSubstructMatches(core_query)
     if not matches:
-        return False  # no match at all — ReplaceCore will return None, handled upstream
+        return False
 
     for match in matches:
         match_atom_set = set(match)
@@ -83,38 +73,26 @@ def _has_fused_match(mol: Chem.Mol, core_mol: Chem.Mol) -> bool:
                 != (bond.GetEndAtomIdx() in match_atom_set))
         )
         if not cuts_ring_bond:
-            return False  # at least one clean match exists
-    return True  # every match cuts a ring bond
+            return False
+    return True
 
 
 def _strip_exit_vectors(
     core_mol: Chem.Mol,
 ) -> tuple[Chem.Mol | None, frozenset[int]]:
-    """Strip * (dummy) atoms from a core and return the constrained-matching info.
-
-    When exit vectors (*) are present in the core:
-      - The * atoms are removed to produce a plain core suitable for ReplaceCore.
-      - The returned frozenset contains the atom indices *in the stripped core*
-        that neighbored the removed * atoms — these are the only valid substitution
-        sites.  A molecule with fragments at any other site is rejected.
-
-    When no * atoms are present, returns (None, frozenset()) — the caller should
-    use the original core unchanged with no site-filtering.
-    """
+    """Strip * (dummy) atoms from a core and return constrained-matching info."""
     dummy_indices = frozenset(
         a.GetIdx() for a in core_mol.GetAtoms() if a.GetAtomicNum() == 0
     )
     if not dummy_indices:
         return None, frozenset()
 
-    # Neighbors of the * atoms are the declared exit-vector attachment points.
     ev_neighbors_orig: set[int] = set()
     for a in core_mol.GetAtoms():
         if a.GetAtomicNum() == 0:
             for nbr in a.GetNeighbors():
                 ev_neighbors_orig.add(nbr.GetIdx())
 
-    # Remove * atoms (highest index first to keep lower indices stable).
     rw = Chem.RWMol(core_mol)
     for idx in sorted(dummy_indices, reverse=True):
         rw.RemoveAtom(idx)
@@ -124,7 +102,6 @@ def _strip_exit_vectors(
         return None, frozenset()
     stripped_mol = rw.GetMol()
 
-    # Build orig_idx → stripped_idx mapping (every removed atom shifts later ones).
     orig_to_stripped: dict[int, int] = {}
     shift = 0
     for orig_idx in range(core_mol.GetNumAtoms()):
@@ -145,21 +122,7 @@ def _decompose_replacecore(
 ) -> tuple[Chem.Mol | None, list[tuple[str, dict[int, str]]]]:
     """Decompose EAs into per-site fragments using ReplaceCore + GetMolFrags.
 
-    Uses ReplaceCore(..., labelByIndex=True) so each dummy atom's isotope
-    encodes the core atom index, giving consistent site labeling across all EAs.
-
-    EAs where every substructure match of the core would cut a ring bond (fused
-    ring mismatch) are skipped with a warning rather than crashing.
-
-    When the core contains explicit exit vectors (*), the * atoms are stripped
-    before matching so ReplaceCore sees a plain scaffold.  Only molecules whose
-    substituents fall exclusively at the declared exit-vector positions are kept;
-    any molecule with a substituent at a non-exit-vector core position is rejected.
-
-    Returns:
-        core_mol: parsed core molecule, stripped of * atoms if present (None on failure)
-        rows: list of (original_smiles, {core_attach_idx: fragment_smi})
-              one entry per successfully decomposed EA
+    Used only internally by FreeWilsonVAGenerator.generate() legacy shim.
     """
     core_mol = Chem.MolFromSmiles(core_smiles)
     if core_mol is None:
@@ -168,10 +131,9 @@ def _decompose_replacecore(
         warnings.warn(f"Could not parse core SMILES: {core_smiles!r}")
         return None, []
 
-    # Strip exit vectors if present; use stripped core for all matching.
     stripped_mol, ev_sites = _strip_exit_vectors(core_mol)
     match_core = stripped_mol if stripped_mol is not None else core_mol
-    has_ev = stripped_mol is not None  # True = apply site-filtering
+    has_ev = stripped_mol is not None
 
     rows: list[tuple[str, dict[int, str]]] = []
     n_fused_skipped = 0
@@ -202,8 +164,6 @@ def _decompose_replacecore(
         if not site_map:
             continue
 
-        # When exit vectors are declared, reject molecules with substituents
-        # at positions outside the declared * positions.
         if has_ev and not site_map.keys() <= ev_sites:
             n_ev_rejected += 1
             continue
@@ -233,17 +193,7 @@ def _assemble_from_site_frags(
     core_mol: Chem.Mol,
     site_frags: dict[int, str],
 ) -> str | None:
-    """Reassemble a molecule from a core and per-site fragment SMILES.
-
-    site_frags: {core_atom_idx: fragment_smi_with_:1_map_on_attachment_neighbor}
-
-    Follows the blog.walters approach:
-      for each (core_attach_idx, frag):
-        CombineMols(running, frag)
-        find atom with map :1 → end_atm
-        AddBond(core_attach_idx, end_atm)
-        clear all map numbers
-    """
+    """Reassemble a molecule from a core and per-site fragment SMILES."""
     try:
         rw = RWMol(core_mol)
 
@@ -255,7 +205,6 @@ def _assemble_from_site_frags(
             combined = Chem.CombineMols(rw, frag_mol)
             rw = RWMol(combined)
 
-            # Find the fragment attachment atom (map :1)
             end_atm = -1
             for atom in rw.GetAtoms():
                 if atom.GetAtomMapNum() == 1:
@@ -264,8 +213,6 @@ def _assemble_from_site_frags(
             if end_atm < 0:
                 return None
 
-            # Clear explicit Hs before adding bond to avoid valence overflow
-            # (ReplaceCore leaves an explicit H on heteroatom attachment neighbors)
             rw.GetAtomWithIdx(end_atm).SetNumExplicitHs(0)
             rw.GetAtomWithIdx(end_atm).SetNoImplicit(False)
 
@@ -290,31 +237,30 @@ def _canonical(smi: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 class CloseInVAGenerator(VAGenerator):
-    """Close-in VA generator with optional paper-mode random H-aware sampling.
+    """Close-in VA generator: random H-aware sampling over EA-derived substituents.
 
-    paper_mode=False (default / legacy): deterministic Cartesian enumeration
-        over all fragment pools.  Every site must be filled; H / no-substituent
-        is not modelled.  First n valid products in sorted-fragment order.
+    Decorates all substitution sites on the core with randomly selected
+    substituents extracted from the analog series. At each site, substituents
+    are chosen with probability p_sub (AS-specific global substitution
+    probability); sites are left as H/no-substituent with probability 1-p_sub.
 
-    paper_mode=True: random sampling weighted by the observed per-series
-        substitution probability.  Each site is either filled with a randomly
-        chosen organic fragment or left as H/no-substituent according to
-        p_sub.  Requires random_state for reproducibility.
+    Uses a SeriesDecomposition as its primary input. The `generate()` method
+    accepts raw SMILES and activities for drop-in compatibility with other
+    VAGenerator subclasses, but internally calls decompose_series first.
     """
 
     strategy_name = "close_in"
 
     def __init__(
         self,
-        paper_mode: bool = False,
         random_state: int | None = None,
-        max_attempts: int = 1_000_000,
+        max_attempts: int = 100_000,
         min_organic_substituents: int = 1,
     ) -> None:
-        self.paper_mode = paper_mode
         self.random_state = random_state
         self.max_attempts = max_attempts
         self.min_organic_substituents = min_organic_substituents
+        self.generation_report: dict = {}
 
     def generate(
         self,
@@ -328,98 +274,67 @@ class CloseInVAGenerator(VAGenerator):
             warnings.warn("CloseInVAGenerator requires a core SMILES. Skipping.")
             return []
 
-        if self.paper_mode:
-            return self._generate_paper(ea_smiles, core_smiles, n, ea_hac_range)
-        else:
-            return self._generate_legacy(ea_smiles, core_smiles, n, ea_hac_range)
-
-    # ------------------------------------------------------------------
-    # Legacy path (unchanged deterministic Cartesian enumeration)
-    # ------------------------------------------------------------------
-
-    def _generate_legacy(
-        self,
-        ea_smiles: list[str],
-        core_smiles: str,
-        n: int,
-        ea_hac_range: tuple[int, int],
-    ) -> list[str]:
-        core_mol, rows = _decompose_replacecore(core_smiles, ea_smiles)
-        if core_mol is None or not rows:
-            return []
-
-        all_sites: set[int] = set()
-        for _, site_map in rows:
-            all_sites.update(site_map.keys())
-        site_list = sorted(all_sites)
-        if not site_list:
-            return []
-
-        pools: dict[int, set[str]] = {s: set() for s in site_list}
-        for _, site_map in rows:
-            for site, frag_smi in site_map.items():
-                if frag_smi is not None:
-                    pools[site].add(frag_smi)
-
-        ea_set = {c for s in ea_smiles if (c := _canonical(s)) is not None}
-        min_hac, max_hac = ea_hac_range
-        results: list[str] = []
-        seen: set[str] = set()
-        pool_lists = [sorted(pools[s]) for s in site_list]
-
-        for combo in itertools.product(*pool_lists):
-            site_frags = dict(zip(site_list, combo))
-            smi = _assemble_from_site_frags(core_mol, site_frags)
-            if smi is None:
-                continue
-            mol = Chem.MolFromSmiles(smi)
-            if mol is None:
-                continue
-            hac = mol.GetNumHeavyAtoms()
-            if hac < min_hac or hac > max_hac:
-                continue
-            canon = Chem.MolToSmiles(mol)
-            if canon in seen or canon in ea_set:
-                continue
-            seen.add(canon)
-            results.append(canon)
-            if len(results) >= n:
-                break
-
-        return results
-
-    # ------------------------------------------------------------------
-    # Paper-mode path (random H-aware sampling)
-    # ------------------------------------------------------------------
-
-    def _generate_paper(
-        self,
-        ea_smiles: list[str],
-        core_smiles: str,
-        n: int,
-        ea_hac_range: tuple[int, int],
-    ) -> list[str]:
         from ..series.decomposition import decompose_series
-        from ..series.assembly import assemble_series_member
+        import dataclasses
 
-        decomp = decompose_series(
-            core_smiles, ea_smiles, paper_mode=True,
-        )
+        decomp = decompose_series(core_smiles, ea_smiles,
+                                  ea_activities=list(ea_activities))
         if not decomp.ea_records or not decomp.site_list:
             return []
 
-        rng = np.random.default_rng(self.random_state)
+        # Override decomp's HAC range with the externally-provided one
+        decomp = dataclasses.replace(decomp, ea_hac_range=ea_hac_range)
+        return self._sample_from_decomp(decomp, n, self.random_state)
+
+    def generate_from_decomposition(
+        self,
+        decomp,
+        n: int = 1000,
+        random_state: int | None = None,
+    ) -> list[str]:
+        """Generate close-in VAs from a pre-computed SeriesDecomposition.
+
+        Preferred over `generate()` when the same decomp is shared with FW
+        and scoring to avoid redundant decomposition.
+        """
+        rng_seed = random_state if random_state is not None else self.random_state
+
+        if not decomp.ea_records or not decomp.site_list:
+            self.generation_report = {
+                "n_requested": n, "n_generated": 0,
+                "n_attempts": 0, "n_invalid": 0,
+                "n_duplicate": 0, "n_existing_analog": 0,
+                "n_outside_hac_range": 0,
+                "substitution_probability": decomp.substitution_probability,
+                "probability_mode": "global",
+                "random_state": rng_seed,
+            }
+            return []
+
+        return self._sample_from_decomp(decomp, n, rng_seed)
+
+    def _sample_from_decomp(self, decomp, n: int, random_state) -> list[str]:
+        """H-aware random sampling from a SeriesDecomposition."""
+        from ..series.assembly import assemble_series_member
+
+        rng = np.random.default_rng(random_state)
         p_sub = decomp.substitution_probability
         site_list = decomp.site_list
         pool_arrays = {s: sorted(decomp.site_pools[s]) for s in site_list}
         ea_set = decomp.ea_canonical_set
-        min_hac, max_hac = ea_hac_range
+        min_hac, max_hac = decomp.ea_hac_range
 
         results: list[str] = []
         seen: set[str] = set()
         attempts = 0
+        n_invalid = 0
+        n_duplicate = 0
+        n_existing = 0
+        n_outside_hac = 0
+        stagnation = 0
+        stagnation_limit = max(1000, n * 10)
 
-        while len(results) < n and attempts < self.max_attempts:
+        while len(results) < n and attempts < self.max_attempts and stagnation < stagnation_limit:
             attempts += 1
             site_map: dict[int, str | None] = {}
             for s in site_list:
@@ -435,16 +350,41 @@ class CloseInVAGenerator(VAGenerator):
 
             smi = assemble_series_member(decomp, site_map)
             if smi is None:
+                n_invalid += 1
+                stagnation += 1
                 continue
             mol = Chem.MolFromSmiles(smi)
             if mol is None:
+                n_invalid += 1
+                stagnation += 1
                 continue
             hac = mol.GetNumHeavyAtoms()
             if hac < min_hac or hac > max_hac:
+                n_outside_hac += 1
+                stagnation += 1
                 continue
-            if smi in seen or smi in ea_set:
+            if smi in ea_set:
+                n_existing += 1
+                stagnation += 1
+                continue
+            if smi in seen:
+                n_duplicate += 1
+                stagnation += 1
                 continue
             seen.add(smi)
             results.append(smi)
+            stagnation = 0
 
+        self.generation_report = {
+            "n_requested": n,
+            "n_generated": len(results),
+            "n_attempts": attempts,
+            "n_invalid": n_invalid,
+            "n_duplicate": n_duplicate,
+            "n_existing_analog": n_existing,
+            "n_outside_hac_range": n_outside_hac,
+            "substitution_probability": p_sub,
+            "probability_mode": "global",
+            "random_state": random_state,
+        }
         return results

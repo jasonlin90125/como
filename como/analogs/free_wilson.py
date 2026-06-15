@@ -7,12 +7,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
 
-import networkx as nx
 import numpy as np
 from rdkit import Chem
 
 from .base import VAGenerator
-from .close_in import _assemble_from_site_frags, _decompose_replacecore
+from .close_in import _assemble_from_site_frags
 
 
 @dataclass
@@ -36,6 +35,139 @@ class FWCandidate:
         return len(self.fw_preds)
 
 
+def _mean_activity(idx_list: list[int], activities: np.ndarray) -> float:
+    """Return the mean activity for the given row indices, ignoring NaN."""
+    vals = activities[idx_list]
+    finite = vals[np.isfinite(vals)]
+    if len(finite) == 0:
+        return float("nan")
+    return float(finite.mean())
+
+
+def _discover_fw_candidates(
+    row_site_maps: list[dict[int, str | None]],
+    row_activities: np.ndarray,
+    site_list: list[int],
+    rows_for_canon: list[str],
+) -> tuple[dict[tuple, FWCandidate], set[int], dict[str, list[float]]]:
+    """Core FW matrix discovery algorithm.
+
+    Returns:
+        candidates_by_key: deduped FW VA candidates
+        ea_in_nbh_indices: row indices that participate in ≥1 qualifying matrix
+        fw_ea_predictions: {canonical_smiles: [predicted_pActivity, ...]}
+    """
+    candidates_by_key: dict[tuple, FWCandidate] = {}
+    ea_in_nbh_indices: set[int] = set()
+    fw_ea_predictions: dict[str, list[float]] = {}
+
+    for site_a, site_b in combinations(site_list, 2):
+        rest_sites = [s for s in site_list if s not in (site_a, site_b)]
+        matrices: dict[tuple, dict[tuple, list[int]]] = defaultdict(lambda: defaultdict(list))
+
+        for ea_idx, sm in enumerate(row_site_maps):
+            ra = sm.get(site_a)
+            rb = sm.get(site_b)
+            context = tuple(sm.get(s) for s in rest_sites)
+            matrices[context][(ra, rb)].append(ea_idx)
+
+        for context, matrix in matrices.items():
+            ra_vals = sorted(
+                {k[0] for k in matrix},
+                key=lambda x: (x is None, x or ""),
+            )
+            rb_vals = sorted(
+                {k[1] for k in matrix},
+                key=lambda x: (x is None, x or ""),
+            )
+
+            for ra1, ra2 in combinations(ra_vals, 2):
+                for rb1, rb2 in combinations(rb_vals, 2):
+                    corners = [(ra1, rb1), (ra1, rb2), (ra2, rb1), (ra2, rb2)]
+                    present = [(c, matrix[c]) for c in corners if c in matrix]
+                    missing = [c for c in corners if c not in matrix]
+
+                    if len(present) == 4:
+                        # All-four-corner: retrospective FW EA validation
+                        # Hold each corner out; predict from the other three.
+                        for held_c, held_rows in present:
+                            same_a = [idx for c, rows_list in present
+                                      for idx in rows_list
+                                      if c[0] == held_c[0] and c != held_c]
+                            same_b = [idx for c, rows_list in present
+                                      for idx in rows_list
+                                      if c[1] == held_c[1] and c != held_c]
+                            base = [idx for c, rows_list in present
+                                    for idx in rows_list
+                                    if c[0] != held_c[0] and c[1] != held_c[1]]
+                            if not same_a or not same_b or not base:
+                                continue
+                            # Average activities across duplicate corners
+                            act_a = _mean_activity(same_a, row_activities)
+                            act_b = _mean_activity(same_b, row_activities)
+                            act_base = _mean_activity(base, row_activities)
+                            if any(np.isnan([act_a, act_b, act_base])):
+                                continue
+                            pred = float(act_a + act_b - act_base)
+                            for held_idx in held_rows:
+                                canon_smi = _row_to_canon(rows_for_canon[held_idx])
+                                if canon_smi:
+                                    fw_ea_predictions.setdefault(canon_smi, []).append(pred)
+                        for _, idx_list in present:
+                            ea_in_nbh_indices.update(idx_list)
+                        continue
+
+                    if len(present) != 3 or len(missing) != 1:
+                        continue
+
+                    missing_ra, missing_rb = missing[0]
+
+                    same_a_rows = same_b_rows = base_rows = None
+                    for (r_a, r_b), idx_list in present:
+                        if r_a == missing_ra:
+                            same_a_rows = idx_list
+                        elif r_b == missing_rb:
+                            same_b_rows = idx_list
+                        else:
+                            base_rows = idx_list
+
+                    if same_a_rows is None or same_b_rows is None or base_rows is None:
+                        continue
+
+                    # Average activities across duplicate corners (fixes arbitrary first-row)
+                    act_a = _mean_activity(same_a_rows, row_activities)
+                    act_b = _mean_activity(same_b_rows, row_activities)
+                    act_base = _mean_activity(base_rows, row_activities)
+                    if any(np.isnan([act_a, act_b, act_base])):
+                        continue
+                    fw_pred = float(act_a + act_b - act_base)
+
+                    # Build site_frags from the same_a corner's site map
+                    base_frags = {k: v for k, v in row_site_maps[same_a_rows[0]].items()
+                                  if v is not None}
+                    if missing_ra is not None:
+                        base_frags[site_a] = missing_ra
+                    elif site_a in base_frags:
+                        del base_frags[site_a]
+                    if missing_rb is not None:
+                        base_frags[site_b] = missing_rb
+                    elif site_b in base_frags:
+                        del base_frags[site_b]
+
+                    dedup_key = tuple(base_frags.get(s) for s in sorted(site_list))
+                    if dedup_key not in candidates_by_key:
+                        candidates_by_key[dedup_key] = FWCandidate(site_frags=base_frags)
+                    candidates_by_key[dedup_key].fw_preds.append(fw_pred)
+                    candidates_by_key[dedup_key].supporting_ea_indices.append(
+                        (same_a_rows[0], same_b_rows[0], base_rows[0])
+                    )
+                    candidates_by_key[dedup_key].varying_sites_list.append((site_a, site_b))
+                    for _, idx_list in present:
+                        ea_in_nbh_indices.update(idx_list)
+
+    return candidates_by_key, ea_in_nbh_indices, fw_ea_predictions
+
+
 class FreeWilsonVAGenerator(VAGenerator):
     """Free-Wilson VA generator.
 
@@ -43,6 +175,9 @@ class FreeWilsonVAGenerator(VAGenerator):
     DeepCOMO paper.  For each pair of substitution sites and each fixed
     context of all remaining sites, a missing 4th corner is a FW VA candidate
     predicted by additivity.
+
+    Duplicate corner entries use mean activity across all EAs at that corner,
+    not the first-row arbitrary pick.
 
     EAs are counted as being in a FW neighborhood only when they participate
     in at least one qualifying 2×2 matrix (3 present + 1 missing, or all 4
@@ -58,9 +193,8 @@ class FreeWilsonVAGenerator(VAGenerator):
         self.n_ea_in_fw_nbh: int = 0
         self.n_sites: int = 0
         self.n_unique_substituents: int = 0
-        self._mmp_graph: nx.Graph | None = None
-        # Retrospective FW EA predictions {canonical_smiles: list[float]}
         self.fw_ea_predictions: dict[str, list[float]] = {}
+        self.fw_neighborhood_records: list[dict] = []
 
     def generate(
         self,
@@ -70,6 +204,72 @@ class FreeWilsonVAGenerator(VAGenerator):
         n: int,
         ea_hac_range: tuple[int, int],
     ) -> list[str]:
+        """VAGenerator interface shim: decompose and delegate to generate_from_decomposition."""
+        if core_smiles is None:
+            warnings.warn("FreeWilsonVAGenerator requires a core SMILES. Skipping.")
+            return []
+
+        from ..series.decomposition import decompose_series
+        import dataclasses
+
+        decomp = decompose_series(core_smiles, ea_smiles,
+                                  ea_activities=list(ea_activities))
+        # Apply externally-provided HAC range
+        decomp = dataclasses.replace(decomp, ea_hac_range=ea_hac_range)
+        return self.generate_from_decomposition(decomp)
+
+    def generate_from_decomposition(
+        self,
+        decomp,
+        n: int | None = None,
+        hac_range: tuple[int, int] | None = None,
+        paper_mode: bool = False,
+    ) -> list[str]:
+        """Generate FW VAs from a pre-computed SeriesDecomposition.
+
+        When paper_mode=True, n is ignored (count is determined by the series).
+        """
+        from ..series.assembly import _assemble_core_plus_frags
+
+        self._reset_state()
+
+        if paper_mode and n is not None:
+            import sys
+            print(
+                "[COMO] FW paper_mode: n is ignored — FW VA count is series-determined.",
+                file=sys.stderr,
+            )
+
+        if not decomp.ea_records or not decomp.site_list:
+            return []
+
+        site_list = list(decomp.site_list)
+        if len(site_list) < 2:
+            return []
+
+        self.n_sites = len(site_list)
+        self.n_unique_substituents = sum(len(pool) for pool in decomp.site_pools.values())
+
+        # Build row_site_maps and activities from the decomp records
+        row_site_maps = [dict(r.site_map) for r in decomp.ea_records]
+        row_activities = np.array([r.activity for r in decomp.ea_records], dtype=np.float64)
+        rows_for_canon = [r.canonical_smiles for r in decomp.ea_records]
+        ea_set = decomp.ea_canonical_set
+
+        candidates_by_key, ea_in_nbh_indices, fw_ea_preds = _discover_fw_candidates(
+            row_site_maps, row_activities, site_list, rows_for_canon,
+        )
+
+        self.n_ea_in_fw_nbh = len(ea_in_nbh_indices)
+        self.fw_ea_predictions = fw_ea_preds
+
+        min_hac, max_hac = hac_range if hac_range is not None else decomp.ea_hac_range
+
+        return self._assemble_candidates(
+            candidates_by_key, decomp.core_mol, ea_set, min_hac, max_hac, site_list,
+        )
+
+    def _reset_state(self) -> None:
         self.fw_predictions = {}
         self.fw_pred_std = {}
         self.fw_pred_n = {}
@@ -77,152 +277,17 @@ class FreeWilsonVAGenerator(VAGenerator):
         self.n_sites = 0
         self.n_unique_substituents = 0
         self.fw_ea_predictions = {}
+        self.fw_neighborhood_records = []
 
-        if core_smiles is None:
-            warnings.warn("FreeWilsonVAGenerator requires a core SMILES. Skipping.")
-            return []
-
-        core_mol, rows = _decompose_replacecore(core_smiles, ea_smiles)
-        if core_mol is None or not rows:
-            return []
-
-        # Build unified site_list (organic sites only, like legacy)
-        all_sites: set[int] = set()
-        for _, site_map in rows:
-            all_sites.update(k for k, v in site_map.items() if v is not None)
-        site_list = sorted(all_sites)
-
-        if len(site_list) < 2:
-            return []
-
-        # Compute stats consumed by scoring.py
-        unique_subs_per_site = {
-            s: {sm.get(s) for _, sm in rows if sm.get(s) is not None}
-            for s in site_list
-        }
-        self.n_sites = len(site_list)
-        self.n_unique_substituents = sum(len(v) for v in unique_subs_per_site.values())
-
-        ea_set: set[str] = set()
-        for s in ea_smiles:
-            mol = Chem.MolFromSmiles(s)
-            if mol is not None:
-                ea_set.add(Chem.MolToSmiles(mol))
-
-        # Align activities with decomposed rows
-        row_site_maps: list[dict[int, str | None]] = [sm for _, sm in rows]
-        row_activities = self._align_activities(rows, ea_smiles, ea_activities)
-
-        # MMP graph (for diagnostics; not used for EA-in-NBH counting)
-        self._mmp_graph = self._build_mmp_graph(row_site_maps, site_list)
-
-        # Context-fixed FW discovery
-        candidates_by_key: dict[tuple, FWCandidate] = {}
-        ea_in_nbh_indices: set[int] = set()
-
-        for site_a, site_b in combinations(site_list, 2):
-            rest_sites = [s for s in site_list if s not in (site_a, site_b)]
-            # group rows by fixed context of all other sites
-            matrices: dict[tuple, dict[tuple, list[int]]] = defaultdict(lambda: defaultdict(list))
-
-            for ea_idx, sm in enumerate(row_site_maps):
-                ra = sm.get(site_a)  # may be None (H)
-                rb = sm.get(site_b)  # may be None (H)
-                context = tuple(sm.get(s) for s in rest_sites)
-                matrices[context][(ra, rb)].append(ea_idx)
-
-            for context, matrix in matrices.items():
-                ra_vals = sorted(
-                    {k[0] for k in matrix},
-                    key=lambda x: (x is None, x or ""),
-                )
-                rb_vals = sorted(
-                    {k[1] for k in matrix},
-                    key=lambda x: (x is None, x or ""),
-                )
-
-                for ra1, ra2 in combinations(ra_vals, 2):
-                    for rb1, rb2 in combinations(rb_vals, 2):
-                        corners = [(ra1, rb1), (ra1, rb2), (ra2, rb1), (ra2, rb2)]
-                        present = [(c, matrix[c]) for c in corners if c in matrix]
-                        missing = [c for c in corners if c not in matrix]
-
-                        if len(present) == 4:
-                            # Retrospective FW EA: hold each corner out once
-                            for held_c, held_rows in present:
-                                same_a_rows = [idx for c, rows_list in present
-                                               for idx in rows_list
-                                               if c[0] == held_c[0] and c != held_c]
-                                same_b_rows = [idx for c, rows_list in present
-                                               for idx in rows_list
-                                               if c[1] == held_c[1] and c != held_c]
-                                base_rows = [idx for c, rows_list in present
-                                             for idx in rows_list
-                                             if c[0] != held_c[0] and c[1] != held_c[1]]
-                                if not same_a_rows or not same_b_rows or not base_rows:
-                                    continue
-                                acts = row_activities[[same_a_rows[0], same_b_rows[0], base_rows[0]]]
-                                if np.any(np.isnan(acts)):
-                                    continue
-                                pred = float(acts[0] + acts[1] - acts[2])
-                                for held_idx in held_rows:
-                                    canon_smi = _row_to_canon(rows[held_idx][0])
-                                    if canon_smi:
-                                        self.fw_ea_predictions.setdefault(canon_smi, []).append(pred)
-                            # All 4 corners participate in qualifying FW neighborhoods
-                            for _, idx_list in present:
-                                ea_in_nbh_indices.update(idx_list)
-                            continue
-
-                        if len(present) != 3 or len(missing) != 1:
-                            continue
-
-                        missing_ra, missing_rb = missing[0]
-
-                        same_a_rows = same_b_rows = base_rows = None
-                        for (r_a, r_b), idx_list in present:
-                            if r_a == missing_ra:
-                                same_a_rows = idx_list
-                            elif r_b == missing_rb:
-                                same_b_rows = idx_list
-                            else:
-                                base_rows = idx_list
-
-                        if same_a_rows is None or same_b_rows is None or base_rows is None:
-                            continue
-
-                        acts = row_activities[[same_a_rows[0], same_b_rows[0], base_rows[0]]]
-                        if np.any(np.isnan(acts)):
-                            continue
-                        fw_pred = float(acts[0] + acts[1] - acts[2])
-
-                        # Build site_frags for this candidate from same_a's context
-                        base_frags = {k: v for k, v in row_site_maps[same_a_rows[0]].items()
-                                      if v is not None}
-                        if missing_ra is not None:
-                            base_frags[site_a] = missing_ra
-                        elif site_a in base_frags:
-                            del base_frags[site_a]
-                        if missing_rb is not None:
-                            base_frags[site_b] = missing_rb
-                        elif site_b in base_frags:
-                            del base_frags[site_b]
-
-                        dedup_key = tuple(base_frags.get(s) for s in sorted(site_list))
-                        if dedup_key not in candidates_by_key:
-                            candidates_by_key[dedup_key] = FWCandidate(site_frags=base_frags)
-                        candidates_by_key[dedup_key].fw_preds.append(fw_pred)
-                        candidates_by_key[dedup_key].supporting_ea_indices.append(
-                            (same_a_rows[0], same_b_rows[0], base_rows[0])
-                        )
-                        candidates_by_key[dedup_key].varying_sites_list.append((site_a, site_b))
-                        # All 3 present corners participate
-                        for _, idx_list in present:
-                            ea_in_nbh_indices.update(idx_list)
-
-        self.n_ea_in_fw_nbh = len(ea_in_nbh_indices)
-
-        min_hac, max_hac = ea_hac_range
+    def _assemble_candidates(
+        self,
+        candidates_by_key: dict,
+        core_mol,
+        ea_set: frozenset[str] | set[str],
+        min_hac: int,
+        max_hac: int,
+        site_list: list[int],
+    ) -> list[str]:
         results: list[str] = []
         seen: set[str] = set()
 
@@ -247,40 +312,6 @@ class FreeWilsonVAGenerator(VAGenerator):
 
         return results
 
-    @staticmethod
-    def _align_activities(
-        rows: list[tuple[str, dict]],
-        ea_smiles: list[str],
-        ea_activities: np.ndarray,
-    ) -> np.ndarray:
-        canon_to_act: dict[str, float] = {}
-        for smi, act in zip(ea_smiles, ea_activities):
-            mol = Chem.MolFromSmiles(smi)
-            if mol is not None:
-                canon_to_act[Chem.MolToSmiles(mol)] = float(act)
-
-        aligned = []
-        for orig_smi, _ in rows:
-            mol = Chem.MolFromSmiles(orig_smi)
-            canon = Chem.MolToSmiles(mol) if mol else orig_smi
-            aligned.append(canon_to_act.get(canon, float("nan")))
-        return np.array(aligned)
-
-    def _build_mmp_graph(
-        self,
-        row_site_maps: list[dict[int, str | None]],
-        site_list: list[int],
-    ) -> nx.Graph:
-        g = nx.Graph()
-        g.add_nodes_from(range(len(row_site_maps)))
-        for i, j in combinations(range(len(row_site_maps)), 2):
-            diff_sites = [
-                s for s in site_list
-                if row_site_maps[i].get(s) != row_site_maps[j].get(s)
-            ]
-            if len(diff_sites) == 1:
-                g.add_edge(i, j, site=diff_sites[0])
-        return g
 
 
 def _row_to_canon(smi: str) -> str | None:

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
 
 from .descriptors import DESCRIPTOR_NAMES
+
+if TYPE_CHECKING:
+    from .series.schema import SeriesDecomposition
+    from .potency import PaperSVRResult
 
 
 @dataclass
@@ -41,6 +47,7 @@ class ComoResult:
     fw_n_unique_substituents: int
 
     # FW per-candidate prediction details (smiles -> mean/std/n)
+    fw_predictions: dict[str, float] = field(default_factory=dict)
     fw_pred_std: dict[str, float] = field(default_factory=dict)
     fw_pred_n: dict[str, int] = field(default_factory=dict)
     # Retrospective FW EA predictions {smiles: [pred, ...]}
@@ -49,6 +56,11 @@ class ComoResult:
     # Descriptor info
     descriptor_names: tuple[str, ...] = field(default=DESCRIPTOR_NAMES)
     scaler: object = field(default=None, repr=False)
+
+    # Optional: paper-mode extras (populated when paper_mode=True)
+    decomp: "SeriesDecomposition | None" = field(default=None, repr=False)
+    paper_svr_result: "PaperSVRResult | None" = field(default=None, repr=False)
+    run_metadata: dict = field(default_factory=dict)
 
 
 def build_va_dataframe(
@@ -349,3 +361,252 @@ def write_summary_txt(result: ComoResult, path: Path) -> None:
     ]
 
     Path(path).write_text("\n".join(lines))
+
+
+def write_decomposition_report(result: "ComoResult", path: Path) -> None:
+    """Write decomposition_report.csv with per-EA status and site fragments."""
+    decomp = result.decomp
+    if decomp is None:
+        return
+
+    site_list = list(decomp.site_list)
+    rows = []
+
+    for rec in decomp.ea_records:
+        row: dict = {
+            "input_smiles": rec.input_smiles,
+            "canonical_smiles": rec.canonical_smiles,
+            "status": "decomposed",
+            "rejection_reason": "",
+            "activity": rec.activity,
+            "heavy_atom_count": rec.heavy_atom_count,
+        }
+        for s in site_list:
+            row[f"site_{s}"] = rec.site_map.get(s) or ""
+        rows.append(row)
+
+    for rec in decomp.rejected_records:
+        row = {
+            "input_smiles": rec.input_smiles,
+            "canonical_smiles": "",
+            "status": "rejected",
+            "rejection_reason": rec.reason,
+            "activity": float("nan"),
+            "heavy_atom_count": 0,
+        }
+        for s in site_list:
+            row[f"site_{s}"] = ""
+        rows.append(row)
+
+    if not rows:
+        return
+
+    site_cols = {f"site_{s}": pl.Utf8 for s in site_list}
+    schema = {
+        "input_smiles": pl.Utf8,
+        "canonical_smiles": pl.Utf8,
+        "status": pl.Utf8,
+        "rejection_reason": pl.Utf8,
+        "activity": pl.Float64,
+        "heavy_atom_count": pl.Int64,
+        **site_cols,
+    }
+    pl.DataFrame(rows, schema=schema).write_csv(path)
+
+
+def write_decomposition_summary_json(result: "ComoResult", path: Path) -> None:
+    """Write decomposition_summary.json."""
+    decomp = result.decomp
+    if decomp is None:
+        return
+
+    summary = {
+        "n_input": len(decomp.ea_records) + len(decomp.rejected_records),
+        "n_decomposed": len(decomp.ea_records),
+        "n_rejected": len(decomp.rejected_records),
+        "site_list": list(decomp.site_list),
+        "n_sites": len(decomp.site_list),
+        "unique_substituent_count": len(decomp.unique_substituents),
+        "substitution_probability_global": decomp.substitution_probability,
+        "site_substitution_probability": {
+            str(k): v for k, v in decomp.site_substitution_probability.items()
+        },
+        "ea_hac_range": list(decomp.ea_hac_range),
+        "paper_mode": result.run_metadata.get("paper_mode", False),
+    }
+    Path(path).write_text(json.dumps(summary, indent=2))
+
+
+def write_fw_candidates_csv(result: "ComoResult", path: Path) -> None:
+    """Write fw_candidates.csv with per-candidate FW prediction details."""
+    rows = []
+    va_df = result.va_df
+    if len(va_df) == 0:
+        pl.DataFrame(schema={
+            "smiles": pl.Utf8,
+            "fw_pred_mean": pl.Float64,
+            "fw_pred_std": pl.Float64,
+            "fw_pred_n": pl.Int64,
+        }).write_csv(path)
+        return
+
+    fw_df = va_df.filter(va_df["source_strategy"] == "free_wilson")
+    for row in fw_df.iter_rows(named=True):
+        smi = row["smiles"]
+        rows.append({
+            "smiles": smi,
+            "fw_pred_mean": result.fw_predictions.get(smi, float("nan"))
+            if hasattr(result, "fw_predictions") else row.get("fw_pred_pActivity", float("nan")),
+            "fw_pred_std": result.fw_pred_std.get(smi, 0.0),
+            "fw_pred_n": result.fw_pred_n.get(smi, 1),
+        })
+
+    if not rows:
+        pl.DataFrame(schema={
+            "smiles": pl.Utf8,
+            "fw_pred_mean": pl.Float64,
+            "fw_pred_std": pl.Float64,
+            "fw_pred_n": pl.Int64,
+        }).write_csv(path)
+        return
+
+    pl.DataFrame(rows, schema={
+        "smiles": pl.Utf8,
+        "fw_pred_mean": pl.Float64,
+        "fw_pred_std": pl.Float64,
+        "fw_pred_n": pl.Int64,
+    }).write_csv(path)
+
+
+def write_fw_ea_validation_csv(result: "ComoResult", path: Path) -> None:
+    """Write fw_ea_validation.csv with retrospective FW predictions for EAs."""
+    act_lookup = dict(zip(result.ea_smiles, result.ea_activities.tolist()))
+    rows = []
+    for smi, preds in sorted(result.fw_ea_predictions.items()):
+        obs = act_lookup.get(smi, float("nan"))
+        mean_pred = float(np.mean(preds))
+        std_pred = float(np.std(preds)) if len(preds) > 1 else 0.0
+        abs_err = abs(mean_pred - obs) if np.isfinite(obs) else float("nan")
+        rows.append({
+            "smiles": smi,
+            "observed_pActivity": obs,
+            "fw_pred_mean": mean_pred,
+            "fw_pred_std": std_pred,
+            "fw_pred_n": len(preds),
+            "absolute_error": abs_err,
+        })
+
+    schema = {
+        "smiles": pl.Utf8,
+        "observed_pActivity": pl.Float64,
+        "fw_pred_mean": pl.Float64,
+        "fw_pred_std": pl.Float64,
+        "fw_pred_n": pl.Int64,
+        "absolute_error": pl.Float64,
+    }
+    if not rows:
+        pl.DataFrame(schema=schema).write_csv(path)
+        return
+    pl.DataFrame(rows, schema=schema).write_csv(path)
+
+
+def write_svr_outputs(result: "ComoResult", output_path: Path) -> None:
+    """Write paper SVR output files when paper SVR was used."""
+    paper_svr = result.paper_svr_result
+    if paper_svr is None:
+        return
+
+    meta = result.run_metadata
+
+    # svr_training_summary.csv
+    summary_rows = [{
+        "svr_mode": "paper",
+        "n_ea_train": meta.get("n_ea_train", ""),
+        "n_ea_validation": meta.get("n_ea_validation", ""),
+        "n_external_loaded": meta.get("n_external_loaded", ""),
+        "n_external_valid": meta.get("n_external_valid", ""),
+        "n_external_after_as_exclusion": meta.get("n_external_after_as_exclusion", ""),
+        "fp_type": "ECFP4_2048",
+        "kernel": "tanimoto_precomputed",
+        "outer_folds": len(paper_svr.outer_fold_results),
+        "inner_folds": meta.get("inner_folds", 3),
+        "random_state": meta.get("random_state", 42),
+    }]
+    pl.DataFrame(summary_rows).write_csv(output_path / "svr_training_summary.csv")
+
+    # svr_outer_folds.csv
+    fold_rows = [
+        {
+            "fold": r.fold,
+            "best_C": r.best_C,
+            "best_epsilon": r.best_epsilon,
+            "outer_r2": r.outer_r2,
+            "outer_mae": r.outer_mae,
+            "outer_rmse": r.outer_rmse,
+            "n_train": r.n_train,
+            "n_test": r.n_test,
+        }
+        for r in paper_svr.outer_fold_results
+    ]
+    if fold_rows:
+        pl.DataFrame(fold_rows, schema={
+            "fold": pl.Int64, "best_C": pl.Float64, "best_epsilon": pl.Float64,
+            "outer_r2": pl.Float64, "outer_mae": pl.Float64, "outer_rmse": pl.Float64,
+            "n_train": pl.Int64, "n_test": pl.Int64,
+        }).write_csv(output_path / "svr_outer_folds.csv")
+
+    # svr_external_validation.csv
+    val_rows = [
+        {
+            "smiles": smi,
+            "observed_pActivity": obs,
+            "predicted_pActivity": pred_mean,
+            "prediction_std": pred_std,
+            "absolute_error": abs(pred_mean - obs) if np.isfinite(obs) else float("nan"),
+        }
+        for smi, (obs, pred_mean, pred_std) in sorted(paper_svr.external_validation.items())
+    ]
+    schema_val = {
+        "smiles": pl.Utf8,
+        "observed_pActivity": pl.Float64,
+        "predicted_pActivity": pl.Float64,
+        "prediction_std": pl.Float64,
+        "absolute_error": pl.Float64,
+    }
+    if val_rows:
+        pl.DataFrame(val_rows, schema=schema_val).write_csv(
+            output_path / "svr_external_validation.csv"
+        )
+    else:
+        pl.DataFrame(schema=schema_val).write_csv(output_path / "svr_external_validation.csv")
+
+
+def write_run_metadata_json(result: "ComoResult", path: Path) -> None:
+    """Write run_metadata.json with full provenance for the pipeline run."""
+    import como
+
+    meta = dict(result.run_metadata)
+    meta.setdefault("como_version", getattr(como, "__version__", "0.1.0"))
+
+    # Try to get git commit hash
+    try:
+        import subprocess
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        git_hash = ""
+    meta.setdefault("git_commit", git_hash)
+
+    meta.setdefault("descriptor_space", "rdkit_7d")
+    if result.decomp is not None:
+        meta.setdefault("site_list", list(result.decomp.site_list))
+        meta.setdefault("n_ea_decomposed", len(result.decomp.ea_records))
+        meta.setdefault("n_ea_rejected", len(result.decomp.rejected_records))
+        meta.setdefault(
+            "core_used_after_exit_vector_stripping", result.decomp.core_smiles
+        )
+
+    Path(path).write_text(json.dumps(meta, indent=2, default=str))

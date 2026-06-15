@@ -6,7 +6,7 @@ import warnings
 from collections import Counter
 from itertools import combinations
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import numpy as np
 import polars as pl
@@ -16,7 +16,19 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from .descriptors import compute_descriptors, normalize_descriptors
 from .nbh import build_nbh
 from .potency import SVRPredictor
-from .report import ComoResult, build_va_dataframe, write_fw_predictions_csv, write_scores_csv, write_summary_txt
+from .report import (
+    ComoResult,
+    build_va_dataframe,
+    write_decomposition_report,
+    write_decomposition_summary_json,
+    write_fw_candidates_csv,
+    write_fw_ea_validation_csv,
+    write_fw_predictions_csv,
+    write_run_metadata_json,
+    write_scores_csv,
+    write_summary_txt,
+    write_svr_outputs,
+)
 
 if TYPE_CHECKING:
     from .analogs.base import VAGenerator
@@ -62,6 +74,7 @@ def p_score(membership: np.ndarray, ea_activities: np.ndarray) -> float:
 
     Only VAs in >=2 EA neighborhoods contribute.
     ea_activities must be aligned with membership columns.
+    P is finite and >= 0, but not bounded above by 1.
     """
     if membership.shape[0] == 0:
         return 0.0
@@ -95,6 +108,8 @@ def assign_stage(
     """Assign development stage from S/P quadrant.
 
     Returns one of: 'early', 'early_mid', 'mid', 'late'.
+    Note: thresholds are a heuristic convenience interpretation, not an
+    authoritative DeepCOMO rule.
     """
     high_s = S >= s_threshold
     high_p = P >= p_threshold
@@ -137,185 +152,7 @@ def detect_murcko_core(ea_smiles: list[str]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# ComoAnalysis — orchestrating class
-# ---------------------------------------------------------------------------
-
-class ComoAnalysis:
-    """Orchestrates the full COMO pipeline.
-
-    Holds state (scaler, SVR model, fitted NBH radius) for reuse.
-    """
-
-    def __init__(
-        self,
-        ea_smiles: list[str],
-        ea_activities: np.ndarray,
-        va_generators: list["VAGenerator"],
-        nbh_radius: float | None = None,
-        s_threshold: float = 0.4,
-        p_threshold: float = 0.5,
-        svr_c: float = 10.0,
-        svr_epsilon: float = 0.1,
-    ) -> None:
-        self.ea_smiles = ea_smiles
-        self.ea_activities = np.asarray(ea_activities, dtype=np.float64)
-        self.va_generators = va_generators
-        self.nbh_radius = nbh_radius
-        self.s_threshold = s_threshold
-        self.p_threshold = p_threshold
-        self.svr_c = svr_c
-        self.svr_epsilon = svr_epsilon
-
-    def run(self) -> ComoResult:
-        """Execute the complete COMO pipeline and return a ComoResult."""
-        ea_smiles = self.ea_smiles
-        ea_activities = self.ea_activities
-
-        # --- Compute EA heavy atom count range for VA size filtering ---
-        ea_hacs = []
-        for smi in ea_smiles:
-            mol = Chem.MolFromSmiles(smi)
-            if mol is not None:
-                ea_hacs.append(mol.GetNumHeavyAtoms())
-        if ea_hacs:
-            ea_hac_range = (min(ea_hacs) - 3, max(ea_hacs) + 3)
-        else:
-            ea_hac_range = (0, 100)
-
-        # --- Detect core (may already be known via score_series) ---
-        core_smiles = getattr(self, "_core_smiles", None)
-
-        # --- Generate VA populations ---
-        va_smiles_by_strategy: dict[str, list[str]] = {}
-        for gen in self.va_generators:
-            va_smiles_by_strategy[gen.strategy_name] = gen.generate(
-                ea_smiles, ea_activities, core_smiles,
-                getattr(self, "_va_n", 1000), ea_hac_range
-            )
-
-        # --- Build flat deduplicated VA list ---
-        ea_set = set(Chem.MolToSmiles(Chem.MolFromSmiles(s)) for s in ea_smiles
-                     if Chem.MolFromSmiles(s) is not None)
-        flat_va: list[str] = []
-        seen: set[str] = set()
-        for smi_list in va_smiles_by_strategy.values():
-            for smi in smi_list:
-                if smi not in seen and smi not in ea_set:
-                    seen.add(smi)
-                    flat_va.append(smi)
-
-        # --- Compute descriptors ---
-        ea_raw, ea_valid_idx = compute_descriptors(ea_smiles)
-        ea_activities_aligned = ea_activities[ea_valid_idx]
-
-        if flat_va:
-            va_raw, va_valid_idx = compute_descriptors(flat_va)
-            flat_va_aligned = [flat_va[i] for i in va_valid_idx]
-        else:
-            va_raw = np.empty((0, 7), dtype=np.float64)
-            va_valid_idx = []
-            flat_va_aligned = []
-
-        # --- Normalize (fit on combined EA+VA population) ---
-        ea_norm, va_norm, scaler = normalize_descriptors(ea_raw, va_raw)
-
-        # --- Build NBH membership matrix ---
-        membership, radius_used = build_nbh(ea_norm, va_norm, r=self.nbh_radius)
-
-        # --- Compute scores ---
-        C = c_score(membership)
-        D, d_mean = d_score(membership)
-        S = s_score(C, D)
-        P = p_score(membership, ea_activities_aligned)
-        stage = assign_stage(S, P, self.s_threshold, self.p_threshold)
-
-        # --- SVR potency prediction ---
-        svr = SVRPredictor(C=self.svr_c, epsilon=self.svr_epsilon)
-        cv_metrics = svr.fit(
-            [ea_smiles[i] for i in ea_valid_idx], ea_activities_aligned
-        )
-        if flat_va_aligned:
-            va_pred = svr.predict(flat_va_aligned)
-            va_pct = svr.percentile_rank(va_pred, ea_activities_aligned)
-        else:
-            va_pred = np.array([], dtype=np.float64)
-            va_pct = np.array([], dtype=np.float64)
-
-        # --- Collect FW and external predictions ---
-        from .analogs.free_wilson import FreeWilsonVAGenerator
-        from .analogs.csv_plugin import CSVPluginVAGenerator
-
-        fw_predictions: dict[str, float] = {}
-        external_predictions: dict[str, float] = {}
-        for gen in self.va_generators:
-            if isinstance(gen, FreeWilsonVAGenerator):
-                fw_predictions.update(gen.fw_predictions)
-            elif isinstance(gen, CSVPluginVAGenerator):
-                external_predictions.update(gen.external_activities)
-
-        # --- Build per-VA DataFrame ---
-        va_df = build_va_dataframe(
-            va_smiles_by_strategy=va_smiles_by_strategy,
-            flat_va_aligned=flat_va_aligned,
-            svr_predictions=va_pred,
-            ea_activities=ea_activities_aligned,
-            membership=membership,
-            fw_predictions=fw_predictions,
-            external_predictions=external_predictions,
-        )
-
-        # --- FW stats ---
-        fw_n_candidates = sum(
-            len(v) for k, v in va_smiles_by_strategy.items() if k == "free_wilson"
-        )
-        fw_gen = next(
-            (g for g in self.va_generators if isinstance(g, FreeWilsonVAGenerator)),
-            None,
-        )
-        fw_n_ea_in_nbh = fw_gen.n_ea_in_fw_nbh if fw_gen is not None else 0
-        fw_n_sites = fw_gen.n_sites if fw_gen is not None else 0
-        fw_n_unique_substituents = fw_gen.n_unique_substituents if fw_gen is not None else 0
-        fw_pred_std = fw_gen.fw_pred_std if fw_gen is not None else {}
-        fw_pred_n = fw_gen.fw_pred_n if fw_gen is not None else {}
-        fw_ea_predictions = fw_gen.fw_ea_predictions if fw_gen is not None else {}
-
-        n_ea_total = getattr(self, "_n_ea_with_core", len(ea_smiles))
-        fw_pct = f"{100 * fw_n_ea_in_nbh / n_ea_total:.1f}%" if n_ea_total > 0 else "N/A"
-        print(
-            f"[COMO] EAs: {n_ea_total}  |  "
-            f"EAs in FW NBHs: {fw_n_ea_in_nbh} ({fw_pct})  |  "
-            f"FW sites: {fw_n_sites}  |  "
-            f"Unique subs: {fw_n_unique_substituents}"
-        )
-
-        result = ComoResult(
-            C=C,
-            D=D,
-            d_mean=d_mean,
-            S=S,
-            P=P,
-            stage=stage,
-            radius_used=radius_used,
-            n_ea=len(ea_smiles),
-            ea_smiles=[ea_smiles[i] for i in ea_valid_idx],
-            ea_activities=ea_activities_aligned,
-            cv_r2=cv_metrics["cv_r2"],
-            cv_mae=cv_metrics["cv_mae"],
-            va_df=va_df,
-            fw_n_candidates=fw_n_candidates,
-            fw_n_ea_in_nbh=fw_n_ea_in_nbh,
-            fw_n_sites=fw_n_sites,
-            fw_n_unique_substituents=fw_n_unique_substituents,
-            fw_pred_std=fw_pred_std,
-            fw_pred_n=fw_pred_n,
-            fw_ea_predictions=fw_ea_predictions,
-            scaler=scaler,
-        )
-        return result
-
-
-# ---------------------------------------------------------------------------
-# score_series — one-call public convenience API
+# score_series — one-call public API
 # ---------------------------------------------------------------------------
 
 def score_series(
@@ -334,19 +171,35 @@ def score_series(
     svr_c: float = 10.0,
     svr_epsilon: float = 0.1,
     fragment_lib: str | Path | None = None,
-    paper_mode: bool = False,
     random_state: int = 42,
+    svr_mode: Literal["legacy", "paper", "off"] = "legacy",
+    external_actives_csv: str | Path | None = None,
+    external_smiles_col: str = "smiles",
+    external_activity_col: str = "pActivity",
+    ea_train_fraction: float = 0.5,
+    outer_folds: int = 3,
+    inner_folds: int = 3,
+    svr_c_grid: Sequence[float] = (0.1, 1.0, 10.0, 100.0),
+    svr_epsilon_grid: Sequence[float] = (0.01, 0.05, 0.1, 0.2),
 ) -> ComoResult:
     """Run the full COMO pipeline on an analog series.
 
-    series_csv: path to a CSV file, or a Polars DataFrame already in memory.
-    The data must have at minimum columns for SMILES and pActivity.
-    Writes scores.csv, va_populations.csv, and summary.txt to output_dir.
+    Decomposition is performed once and shared by all VA generators
+    and the scoring protocol.
+
+    Parameters
+    ----------
+    svr_mode:
+        "legacy" (default): EA-only 3-fold CV.
+        "paper": external actives + 50/50 EA split + nested 3-fold double CV.
+            Requires external_actives_csv.
+        "off": skip SVR.
     """
     from .analogs.close_in import CloseInVAGenerator
     from .analogs.diverse import DiverseVAGenerator
     from .analogs.free_wilson import FreeWilsonVAGenerator
     from .analogs.csv_plugin import CSVPluginVAGenerator
+    from .series.decomposition import decompose_series
 
     # --- Load EA data ---
     if isinstance(series_csv, pl.DataFrame):
@@ -368,11 +221,24 @@ def score_series(
     if len(ea_smiles) < 3:
         raise ValueError(f"Need at least 3 EAs, got {len(ea_smiles)}.")
 
+    # --- Validate paper SVR requirements ---
+    if svr_mode == "paper" and external_actives_csv is None:
+        raise ValueError(
+            "--svr-mode paper requires --external-actives. "
+            "Provide a CSV with external target actives, or use svr_mode='legacy'."
+        )
+
+    # --- Warn about auto-radius ---
+    if nbh_radius is None:
+        import sys
+        print(
+            "[COMO] Note: using auto NBH radius (adaptive k-NN median). "
+            "For benchmark runs, supply an explicit --nbh-radius.",
+            file=sys.stderr,
+        )
+
     # --- Input diagnostics ---
-    # Count from df (non-null smiles + activity) so all numbers reflect the
-    # same population that actually enters the pipeline.
-    raw_smiles = df[smiles_col].to_list()
-    valid_mols = [Chem.MolFromSmiles(s) for s in raw_smiles]
+    valid_mols = [Chem.MolFromSmiles(s) for s in ea_smiles]
     n_valid = sum(m is not None for m in valid_mols)
     unique_valid = {Chem.MolToSmiles(m) for m in valid_mols if m is not None}
     n_unique = len(unique_valid)
@@ -383,7 +249,10 @@ def score_series(
         if core:
             print(f"[COMO] Auto-detected core: {core}")
         else:
-            warnings.warn("Could not auto-detect Murcko core. VA strategies requiring a core will be skipped.")
+            warnings.warn(
+                "Could not auto-detect Murcko core. "
+                "VA strategies requiring a core will be skipped."
+            )
 
     if core is not None:
         core_mol = Chem.MolFromSmiles(core)
@@ -413,12 +282,21 @@ def score_series(
         f"{n_with_core} contain core"
     )
 
-    # --- Build generators ---
+    # --- Single shared decomposition ---
+    decomp = None
+    if core is not None:
+        decomp = decompose_series(
+            core_smiles=core,
+            ea_smiles=ea_smiles,
+            ea_activities=ea_activities.tolist(),
+        )
+
+    # --- Generate VA populations ---
     generators: list = []
     strategy_set = set(va_strategies)
 
     if "close_in" in strategy_set:
-        generators.append(CloseInVAGenerator(paper_mode=paper_mode, random_state=random_state))
+        generators.append(CloseInVAGenerator(random_state=random_state))
     if "diverse" in strategy_set:
         generators.append(DiverseVAGenerator(fragment_lib_path=fragment_lib))
     if "free_wilson" in strategy_set:
@@ -426,22 +304,159 @@ def score_series(
     if va_csv is not None:
         generators.append(CSVPluginVAGenerator(csv_path=va_csv, activity_col=va_csv_activity_col))
 
-    # --- Set up and run analysis ---
-    analysis = ComoAnalysis(
-        ea_smiles=ea_smiles,
-        ea_activities=ea_activities,
-        va_generators=generators,
-        nbh_radius=nbh_radius,
-        s_threshold=s_threshold,
-        p_threshold=p_threshold,
-        svr_c=svr_c,
-        svr_epsilon=svr_epsilon,
-    )
-    analysis._core_smiles = core
-    analysis._va_n = va_n
-    analysis._n_ea_with_core = n_with_core
+    va_smiles_by_strategy: dict[str, list[str]] = {}
+    for gen in generators:
+        if decomp is not None and isinstance(gen, CloseInVAGenerator):
+            va_smiles_by_strategy[gen.strategy_name] = \
+                gen.generate_from_decomposition(decomp, n=va_n)
+        elif decomp is not None and isinstance(gen, FreeWilsonVAGenerator):
+            va_smiles_by_strategy[gen.strategy_name] = \
+                gen.generate_from_decomposition(decomp)
+        else:
+            # Diverse, csv_plugin, or no-core fallback
+            ea_hac_range = decomp.ea_hac_range if decomp is not None else (0, 100)
+            va_smiles_by_strategy[gen.strategy_name] = gen.generate(
+                ea_smiles, ea_activities, core, va_n, ea_hac_range
+            )
 
-    result = analysis.run()
+    # --- Build flat deduplicated VA list ---
+    ea_set_canon = {Chem.MolToSmiles(Chem.MolFromSmiles(s))
+                    for s in ea_smiles if Chem.MolFromSmiles(s) is not None}
+    flat_va: list[str] = []
+    seen_va: set[str] = set()
+    for smi_list in va_smiles_by_strategy.values():
+        for smi in smi_list:
+            if smi not in seen_va and smi not in ea_set_canon:
+                seen_va.add(smi)
+                flat_va.append(smi)
+
+    # --- Compute descriptors ---
+    ea_raw, ea_valid_idx = compute_descriptors(ea_smiles)
+    ea_acts_aligned = ea_activities[ea_valid_idx]
+
+    if flat_va:
+        va_raw, va_valid_idx = compute_descriptors(flat_va)
+        flat_va_aligned = [flat_va[i] for i in va_valid_idx]
+    else:
+        va_raw = np.empty((0, 7), dtype=np.float64)
+        va_valid_idx = []
+        flat_va_aligned = []
+
+    ea_norm, va_norm, scaler = normalize_descriptors(ea_raw, va_raw)
+    membership, radius_used = build_nbh(ea_norm, va_norm, r=nbh_radius)
+
+    C = c_score(membership)
+    D, d_mean = d_score(membership)
+    S = s_score(C, D)
+    P = p_score(membership, ea_acts_aligned)
+    stage = assign_stage(S, P, s_threshold, p_threshold)
+
+    # --- SVR potency prediction ---
+    cv_r2 = float("nan")
+    cv_mae = float("nan")
+    paper_svr_result = None
+
+    if svr_mode == "off":
+        va_pred = np.full(len(flat_va_aligned), np.nan)
+    elif svr_mode == "paper":
+        from .potency import PaperSVRPredictor
+        ext_smiles_list, ext_acts_arr, n_ext_loaded, n_ext_valid, n_ext_excl = \
+            _load_external_actives(
+                external_actives_csv, external_smiles_col, external_activity_col,
+                ea_set_canon,
+            )
+        paper_svr = PaperSVRPredictor(
+            c_grid=list(svr_c_grid),
+            epsilon_grid=list(svr_epsilon_grid),
+            outer_folds=outer_folds,
+            inner_folds=inner_folds,
+            ea_train_fraction=ea_train_fraction,
+            random_state=random_state,
+        )
+        paper_svr_result = paper_svr.fit_paper_protocol(
+            [ea_smiles[i] for i in ea_valid_idx], ea_acts_aligned,
+            external_smiles=ext_smiles_list,
+            external_activities=ext_acts_arr if ext_acts_arr is not None else None,
+        )
+        cv_r2 = paper_svr_result.cv_r2_mean
+        cv_mae = paper_svr_result.cv_mae_mean
+        va_pred, _ = paper_svr.predict_ensemble(flat_va_aligned)
+    else:  # legacy
+        svr = SVRPredictor(C=svr_c, epsilon=svr_epsilon)
+        cv_metrics = svr.fit([ea_smiles[i] for i in ea_valid_idx], ea_acts_aligned)
+        cv_r2 = cv_metrics["cv_r2"]
+        cv_mae = cv_metrics["cv_mae"]
+        va_pred = svr.predict(flat_va_aligned) if flat_va_aligned else np.array([], dtype=np.float64)
+
+    # --- Collect FW and external predictions ---
+    fw_predictions: dict[str, float] = {}
+    external_predictions: dict[str, float] = {}
+    fw_gen = None
+    for gen in generators:
+        if isinstance(gen, FreeWilsonVAGenerator):
+            fw_predictions.update(gen.fw_predictions)
+            fw_gen = gen
+        elif isinstance(gen, CSVPluginVAGenerator):
+            external_predictions.update(gen.external_activities)
+
+    va_df = build_va_dataframe(
+        va_smiles_by_strategy=va_smiles_by_strategy,
+        flat_va_aligned=flat_va_aligned,
+        svr_predictions=va_pred,
+        ea_activities=ea_acts_aligned,
+        membership=membership,
+        fw_predictions=fw_predictions,
+        external_predictions=external_predictions,
+    )
+
+    fw_n_candidates = len(va_smiles_by_strategy.get("free_wilson", []))
+    fw_n_ea_in_nbh = fw_gen.n_ea_in_fw_nbh if fw_gen else 0
+    fw_n_sites = fw_gen.n_sites if fw_gen else 0
+    fw_n_unique_subs = fw_gen.n_unique_substituents if fw_gen else 0
+    fw_pred_std = fw_gen.fw_pred_std if fw_gen else {}
+    fw_pred_n_dict = fw_gen.fw_pred_n if fw_gen else {}
+    fw_ea_predictions = fw_gen.fw_ea_predictions if fw_gen else {}
+
+    fw_pct = f"{100 * fw_n_ea_in_nbh / n_with_core:.1f}%" if n_with_core > 0 else "N/A"
+    print(
+        f"[COMO] EAs: {n_with_core}  |  "
+        f"EAs in FW NBHs: {fw_n_ea_in_nbh} ({fw_pct})  |  "
+        f"FW sites: {fw_n_sites}  |  "
+        f"Unique subs: {fw_n_unique_subs}"
+    )
+
+    result = ComoResult(
+        C=C, D=D, d_mean=d_mean, S=S, P=P,
+        stage=stage, radius_used=radius_used,
+        n_ea=len(ea_smiles),
+        ea_smiles=[ea_smiles[i] for i in ea_valid_idx],
+        ea_activities=ea_acts_aligned,
+        cv_r2=cv_r2, cv_mae=cv_mae,
+        va_df=va_df,
+        fw_n_candidates=fw_n_candidates,
+        fw_n_ea_in_nbh=fw_n_ea_in_nbh,
+        fw_n_sites=fw_n_sites,
+        fw_n_unique_substituents=fw_n_unique_subs,
+        fw_predictions=fw_predictions,
+        fw_pred_std=fw_pred_std,
+        fw_pred_n=fw_pred_n_dict,
+        fw_ea_predictions=fw_ea_predictions,
+        scaler=scaler,
+        decomp=decomp,
+        paper_svr_result=paper_svr_result,
+        run_metadata={
+            "random_state": random_state,
+            "core_input": core,
+            "va_strategies": list(va_strategies),
+            "va_n": va_n,
+            "nbh_radius": radius_used,
+            "nbh_radius_mode": "explicit" if nbh_radius is not None else "auto",
+            "svr_mode": svr_mode,
+            "s_threshold": s_threshold,
+            "p_threshold": p_threshold,
+            "n_ea_input": n_rows,
+        },
+    )
 
     # --- Write outputs ---
     output_path = Path(output_dir)
@@ -450,6 +465,14 @@ def score_series(
     result.va_df.write_csv(output_path / "va_populations.csv")
     write_summary_txt(result, output_path / "summary.txt")
     write_fw_predictions_csv(result, output_path / "fw_predictions.csv")
+    write_fw_candidates_csv(result, output_path / "fw_candidates.csv")
+    write_fw_ea_validation_csv(result, output_path / "fw_ea_validation.csv")
+    write_run_metadata_json(result, output_path / "run_metadata.json")
+    if result.decomp is not None:
+        write_decomposition_report(result, output_path / "decomposition_report.csv")
+        write_decomposition_summary_json(result, output_path / "decomposition_summary.json")
+    if result.paper_svr_result is not None:
+        write_svr_outputs(result, output_path)
 
     print(
         f"[COMO] C={result.C:.3f}  D={result.D:.3f}  S={result.S:.3f}  "
@@ -457,6 +480,56 @@ def score_series(
     )
     print(f"[COMO] Results written to {output_path}/")
     return result
+
+
+def _load_external_actives(
+    csv_path,
+    smiles_col: str,
+    activity_col: str,
+    ea_set_canon: set[str],
+) -> tuple[list[str], np.ndarray | None, int, int, int]:
+    """Load and filter external actives CSV.
+
+    Returns (smiles, activities, n_loaded, n_valid, n_excluded_as_ea).
+    """
+    if csv_path is None:
+        return [], None, 0, 0, 0
+
+    df = pl.read_csv(csv_path)
+    if smiles_col not in df.columns or activity_col not in df.columns:
+        raise ValueError(
+            f"External actives CSV must have columns {smiles_col!r} and {activity_col!r}. "
+            f"Found: {df.columns}"
+        )
+    df = df.drop_nulls(subset=[smiles_col, activity_col])
+    n_loaded = len(df)
+
+    ext_smiles_raw = df[smiles_col].to_list()
+    ext_acts_raw = np.array(df[activity_col].to_list(), dtype=np.float64)
+
+    valid_smiles: list[str] = []
+    valid_acts: list[float] = []
+    n_invalid = 0
+    n_excluded = 0
+
+    for smi, act in zip(ext_smiles_raw, ext_acts_raw):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            n_invalid += 1
+            continue
+        if not np.isfinite(act):
+            n_invalid += 1
+            continue
+        canon = Chem.MolToSmiles(mol)
+        if canon in ea_set_canon:
+            n_excluded += 1
+            continue
+        valid_smiles.append(canon)
+        valid_acts.append(float(act))
+
+    n_valid = len(valid_smiles)
+    acts_arr = np.array(valid_acts, dtype=np.float64) if valid_smiles else None
+    return valid_smiles, acts_arr, n_loaded, n_valid, n_excluded
 
 
 # ---------------------------------------------------------------------------
@@ -474,31 +547,27 @@ def score_with_repeats(
     random_state: int = 42,
     s_threshold: float = 0.4,
     p_threshold: float = 0.5,
-    paper_mode: bool = True,
 ) -> dict:
     """Run the COMO diagnostic scoring protocol with multiple random repeats.
 
-    Generates n_va close-in VAs per repeat (paper-mode random sampling) and
-    computes C, D, S, P for each.  Reports mean and std over n_repeats.
+    Generates n_va close-in VAs per repeat using H-aware random sampling and
+    computes C, D, S, and P for each. Reports mean and standard deviation.
 
     Parameters
     ----------
-    paper_mode:
-        When True (default), uses CloseInVAGenerator(paper_mode=True) with
-        H-aware random sampling.  When False, uses legacy deterministic mode
-        (all repeats will be identical).
     random_state:
-        Base seed.  Each repeat uses random_state + repeat_index.
+        Base seed. Each repeat uses random_state + repeat_index.
 
     Returns
     -------
     dict with keys:
-        'repeats': list of dicts, one per repeat (C, D, S, P, stage)
+        'repeats': list of dicts, one per repeat (C, D, S, P, stage, ...)
         'C_mean', 'C_std', 'D_mean', 'D_std', 'S_mean', 'S_std',
         'P_mean', 'P_std'
         'settings': dict of all settings used
     """
     from .analogs.close_in import CloseInVAGenerator
+    from .series.decomposition import decompose_series
 
     # --- Load data ---
     if isinstance(series_csv, pl.DataFrame):
@@ -519,52 +588,79 @@ def score_with_repeats(
         if core:
             print(f"[COMO] Auto-detected core: {core}")
 
-    # Compute EA HAC range for VA size filter
-    ea_hacs = [
-        m.GetNumHeavyAtoms()
-        for s in ea_smiles
-        if (m := Chem.MolFromSmiles(s)) is not None
-    ]
-    ea_hac_range = (min(ea_hacs) - 3, max(ea_hacs) + 3) if ea_hacs else (0, 100)
+    # --- Shared decomposition ---
+    decomp = None
+    if core is not None:
+        decomp = decompose_series(
+            core_smiles=core,
+            ea_smiles=ea_smiles,
+            ea_activities=ea_activities.tolist(),
+        )
 
     # Compute EA descriptors (same for all repeats)
     ea_raw, ea_valid_idx = compute_descriptors(ea_smiles)
     ea_activities_aligned = ea_activities[ea_valid_idx]
 
+    # Fallback HAC range when no decomp
+    ea_hacs = [
+        m.GetNumHeavyAtoms()
+        for s in ea_smiles
+        if (m := Chem.MolFromSmiles(s)) is not None
+    ]
+    ea_hac_range_fallback = (min(ea_hacs) - 3, max(ea_hacs) + 3) if ea_hacs else (0, 100)
+
     repeat_results = []
 
     for rep in range(n_repeats):
         seed = random_state + rep
-        gen = CloseInVAGenerator(
-            paper_mode=paper_mode,
-            random_state=seed,
-        )
-        va_smiles = gen.generate(ea_smiles, ea_activities, core, n_va, ea_hac_range)
+        gen = CloseInVAGenerator(random_state=seed)
+
+        if decomp is not None:
+            va_smiles = gen.generate_from_decomposition(decomp, n=n_va)
+        else:
+            va_smiles = gen.generate(
+                ea_smiles, ea_activities, core, n_va, ea_hac_range_fallback
+            )
 
         if not va_smiles:
-            repeat_results.append({"repeat": rep, "C": 0.0, "D": 0.0, "S": 0.0, "P": 0.0, "stage": "early", "n_va": 0})
+            repeat_results.append({
+                "repeat": rep, "seed": seed,
+                "C": 0.0, "D": 0.0, "S": 0.0, "P": 0.0,
+                "stage": "early", "n_va": 0,
+                "n_ea": len(ea_smiles), "nbh_radius": float("nan"),
+                "d_mean": 1.0, "n_covered_va": 0, "n_overlap_va": 0,
+            })
             continue
 
         va_raw, va_valid_idx = compute_descriptors(va_smiles)
-        _, va_norm, _ = normalize_descriptors(ea_raw, va_raw)
-        ea_norm, _, _ = normalize_descriptors(ea_raw, va_raw)
+        ea_norm, va_norm, _ = normalize_descriptors(ea_raw, va_raw)
 
-        membership, _ = build_nbh(ea_norm, va_norm, r=nbh_radius)
+        membership, radius = build_nbh(ea_norm, va_norm, r=nbh_radius)
 
         C = c_score(membership)
-        D, _ = d_score(membership)
+        D, d_mean = d_score(membership)
         S = s_score(C, D)
         P = p_score(membership, ea_activities_aligned)
         stage = assign_stage(S, P, s_threshold, p_threshold)
 
+        count_j = membership.sum(axis=1)
+        n_covered = int((count_j > 0).sum())
+        n_overlap = int((count_j >= 2).sum())
+
         repeat_results.append({
             "repeat": rep,
+            "seed": seed,
             "C": C,
             "D": D,
             "S": S,
             "P": P,
             "stage": stage,
             "n_va": len(va_smiles),
+            "n_ea": len(ea_smiles),
+            "nbh_radius": radius,
+            "d_mean": d_mean,
+            "n_covered_va": n_covered,
+            "n_overlap_va": n_overlap,
         })
         print(
             f"[COMO] Repeat {rep + 1:2d}/{n_repeats}  "
@@ -592,7 +688,6 @@ def score_with_repeats(
             "n_repeats": n_repeats,
             "nbh_radius": nbh_radius,
             "random_state": random_state,
-            "paper_mode": paper_mode,
             "s_threshold": s_threshold,
             "p_threshold": p_threshold,
         },

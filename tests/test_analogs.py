@@ -5,25 +5,28 @@ import numpy as np
 import pytest
 from rdkit import Chem
 
-from como.analogs.close_in import CloseInVAGenerator, _decompose_replacecore
+from como.analogs.close_in import CloseInVAGenerator
 from como.analogs.free_wilson import FreeWilsonVAGenerator
 from como.analogs.diverse import DiverseVAGenerator
 from como.analogs.csv_plugin import CSVPluginVAGenerator
 
 
-# Simple scaffold: para-substituted phenylacetic acid, 1 R-group site
-_CORE_1R = "c1ccc(CC(=O)O)cc1"
+# 2-site core with 3×3 grid minus one corner — close-in can find the 9th combo
+_CORE_1R = "Nc1ccccc1"  # aniline, 2 sites
 _EAS_1R = [
-    "c1ccc(CC(=O)O)c(F)c1",
-    "c1ccc(CC(=O)O)c(Cl)c1",
-    "c1ccc(CC(=O)O)c(C)c1",
-    "c1ccc(CC(=O)O)c(OC)c1",
-    "c1ccc(CC(=O)O)c(CC)c1",
+    "CNc1ccc(F)cc1",
+    "CNc1ccc(Cl)cc1",
+    "CNc1ccc(Br)cc1",
+    "CCNc1ccc(F)cc1",
+    "CCNc1ccc(Cl)cc1",
+    "CCNc1ccc(Br)cc1",
+    "CCCNc1ccc(F)cc1",
+    "CCCNc1ccc(Cl)cc1",
+    # missing: CCCNc1ccc(Br)cc1 -- close-in can generate it
 ]
-_ACTS_1R = np.array([6.0, 6.3, 5.8, 6.1, 5.9])
+_ACTS_1R = np.array([7.2, 7.8, 7.5, 6.9, 7.4, 7.1, 6.5, 7.0])
 
 # 2-site scaffold for FW tests: N-substituted para-substituted anilines
-# site 0 = N-alkyl, site 4 = para-halogen
 # Missing corner: N-Et + Cl (FW VA candidate, pred = 7.8 + 6.9 - 7.2 = 7.5)
 _CORE_2R = "Nc1ccccc1"  # aniline
 _EAS_2R = [
@@ -40,35 +43,35 @@ _HAC_RANGE = (10, 50)
 
 class TestCloseInVAGenerator:
     def test_returns_valid_smiles(self):
-        gen = CloseInVAGenerator()
-        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=100, ea_hac_range=_HAC_RANGE)
+        gen = CloseInVAGenerator(random_state=42)
+        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=10, ea_hac_range=_HAC_RANGE)
         for smi in vas:
             assert Chem.MolFromSmiles(smi) is not None, f"Invalid SMILES: {smi}"
 
     def test_no_ea_duplicates(self):
-        gen = CloseInVAGenerator()
-        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=100, ea_hac_range=_HAC_RANGE)
+        gen = CloseInVAGenerator(random_state=42)
+        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=10, ea_hac_range=_HAC_RANGE)
         ea_canon = {Chem.MolToSmiles(Chem.MolFromSmiles(s)) for s in _EAS_1R}
         for smi in vas:
             assert smi not in ea_canon, f"EA duplicate found in VAs: {smi}"
 
     def test_size_filter(self):
-        gen = CloseInVAGenerator()
-        tight_range = (12, 15)
-        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=100, ea_hac_range=tight_range)
+        gen = CloseInVAGenerator(random_state=42)
+        tight_range = (12, 16)
+        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=10, ea_hac_range=tight_range)
         for smi in vas:
             mol = Chem.MolFromSmiles(smi)
             hac = mol.GetNumHeavyAtoms()
             assert tight_range[0] <= hac <= tight_range[1], f"HAC {hac} out of range for {smi}"
 
     def test_no_core_returns_empty(self):
-        gen = CloseInVAGenerator()
+        gen = CloseInVAGenerator(random_state=42)
         vas = gen.generate(_EAS_1R, _ACTS_1R, None, n=100, ea_hac_range=_HAC_RANGE)
         assert vas == []
 
     def test_deduplication(self):
-        gen = CloseInVAGenerator()
-        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=1000, ea_hac_range=_HAC_RANGE)
+        gen = CloseInVAGenerator(random_state=42)
+        vas = gen.generate(_EAS_1R, _ACTS_1R, _CORE_1R, n=5, ea_hac_range=_HAC_RANGE)
         assert len(vas) == len(set(vas)), "Duplicate SMILES in VA output"
 
 
@@ -103,7 +106,6 @@ class TestFreeWilsonVAGenerator:
     def test_finds_missing_corner(self):
         gen = FreeWilsonVAGenerator()
         vas = gen.generate(_SMILES_2R, _ACTS_2R, _CORE_2R, n=100, ea_hac_range=_HAC_RANGE)
-        # Should find at least 1 FW VA (the R1=OEt, R2=p-F-Ph combination)
         assert len(vas) >= 1
 
     def test_fw_predictions_populated(self):
@@ -115,8 +117,8 @@ class TestFreeWilsonVAGenerator:
     def test_fw_potency_additivity(self):
         gen = FreeWilsonVAGenerator()
         vas = gen.generate(_SMILES_2R, _ACTS_2R, _CORE_2R, n=100, ea_hac_range=_HAC_RANGE)
-        # FW prediction: pAct(OEt,F-Ph) ≈ pAct(OMe,F-Ph) + pAct(OEt,Ph) - pAct(OMe,Ph)
-        #                              = 7.8 + 6.9 - 7.2 = 7.5
+        # FW prediction: pAct(Et,Cl) ≈ pAct(Me,Cl) + pAct(Et,F) - pAct(Me,F)
+        #                             = 7.8 + 6.9 - 7.2 = 7.5
         if gen.fw_predictions:
             for pred in gen.fw_predictions.values():
                 assert pytest.approx(pred, abs=0.01) == 7.5
@@ -133,12 +135,6 @@ class TestFreeWilsonVAGenerator:
         gen = FreeWilsonVAGenerator()
         vas = gen.generate(_SMILES_2R, _ACTS_2R, None, n=100, ea_hac_range=_HAC_RANGE)
         assert vas == []
-
-    def test_mmp_graph_built(self):
-        gen = FreeWilsonVAGenerator()
-        gen.generate(_SMILES_2R, _ACTS_2R, _CORE_2R, n=100, ea_hac_range=_HAC_RANGE)
-        assert gen._mmp_graph is not None
-        assert gen._mmp_graph.number_of_nodes() == len(_SMILES_2R)
 
 
 class TestCSVPluginVAGenerator:

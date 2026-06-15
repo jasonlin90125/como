@@ -155,7 +155,9 @@ def decompose_series(
     core_smiles: str,
     ea_smiles: list[str],
     ea_activities: list[float] | None = None,
-    paper_mode: bool = False,
+    hac_padding: int | None = None,
+    require_exit_vectors: bool = False,
+    paper_mode: bool = True,
 ) -> SeriesDecomposition:
     """Decompose an analog series against a core scaffold.
 
@@ -167,10 +169,13 @@ def decompose_series(
         Input EA SMILES (will be canonicalized internally).
     ea_activities:
         Aligned pActivity values.  If None, all activities stored as nan.
+    hac_padding:
+        Number of heavy atoms to pad the EA HAC range on each side.
+        Defaults to 0 (exact EA range).
+    require_exit_vectors:
+        When True, raise ValueError if the core has no * dummy atoms.
     paper_mode:
-        When True, site_list is the declared exit-vector positions only and
-        molecules with off-exit-vector substituents are rejected.
-        When False (legacy), site_list is inferred from observed decomposition.
+        Kept for backwards compatibility. No longer changes behavior.
     """
     import math
 
@@ -187,6 +192,12 @@ def decompose_series(
     stripped_mol, ev_sites = _strip_exit_vectors(core_mol)
     match_core = stripped_mol if stripped_mol is not None else core_mol
     has_ev = stripped_mol is not None
+
+    if require_exit_vectors and not has_ev:
+        raise ValueError(
+            "require_exit_vectors=True but the core has no * dummy atoms. "
+            "Add * at substitution sites to declare exit vectors."
+        )
 
     # In paper mode with exit vectors, site_list is the declared sites.
     # We'll finalize site_list after decomposition if not paper_mode.
@@ -212,8 +223,8 @@ def decompose_series(
             rejected.append(RejectedRecord(input_smiles=smi, reason="core_no_match"))
             continue
 
-        # In paper mode, reject molecules with substituents outside exit vectors
-        if paper_mode and has_ev:
+        # Reject molecules with substituents outside declared exit-vector positions
+        if has_ev:
             organic_sites = {k for k, v in site_map.items() if v is not None}
             if not organic_sites <= ev_sites:
                 rejected.append(RejectedRecord(input_smiles=smi, reason="off_exit_vector"))
@@ -267,7 +278,8 @@ def decompose_series(
 
     # --- HAC range ---
     hacs = [r.heavy_atom_count for r in records]
-    ea_hac_range = (min(hacs) - 3, max(hacs) + 3) if hacs else (0, 100)
+    pad = hac_padding if hac_padding is not None else 0
+    ea_hac_range = (min(hacs) - pad, max(hacs) + pad) if hacs else (0, 100)
 
     # Build canonical set from core-only members (no rejected)
     ea_canonical_set = frozenset(r.canonical_smiles for r in records)
@@ -287,7 +299,7 @@ def decompose_series(
             f"[COMO] Warning: {n_ev_rejected} EA(s) rejected — substituents outside declared exit vectors.",
             file=sys.stderr,
         )
-    if n_no_match and paper_mode:
+    if n_no_match:
         print(
             f"[COMO] Warning: {n_no_match} EA(s) do not contain the core scaffold.",
             file=sys.stderr,

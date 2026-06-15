@@ -292,8 +292,10 @@ class PaperSVRPredictor:
         pool_fps: list = list(ea_train_fps)
         pool_acts: list = list(ea_train_acts)
 
-        if external_smiles:
-            ext_acts = np.asarray(external_activities or [], dtype=np.float64)
+        if external_smiles is not None and len(external_smiles) > 0:
+            if external_activities is None:
+                raise ValueError("external_activities must be provided with external_smiles")
+            ext_acts = np.asarray(external_activities, dtype=np.float64)
             for smi, act in zip(external_smiles, ext_acts):
                 fp = _smiles_to_fp(smi)
                 if fp is not None:

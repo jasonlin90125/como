@@ -33,7 +33,7 @@ def egfr_csv(tmp_path):
 class TestScoreWithRepeats:
     def test_returns_dict_with_required_keys(self, egfr_csv):
         result = score_with_repeats(
-            egfr_csv, n_va=50, n_repeats=3, random_state=42, paper_mode=True
+            egfr_csv, n_va=50, n_repeats=3, random_state=42
         )
         for key in ("repeats", "C_mean", "C_std", "D_mean", "D_std",
                     "S_mean", "S_std", "P_mean", "P_std", "settings"):
@@ -41,50 +41,43 @@ class TestScoreWithRepeats:
 
     def test_repeat_count(self, egfr_csv):
         result = score_with_repeats(
-            egfr_csv, n_va=30, n_repeats=5, random_state=42, paper_mode=True
+            egfr_csv, n_va=30, n_repeats=5, random_state=42
         )
         assert len(result["repeats"]) == 5
 
     def test_scores_in_range(self, egfr_csv):
         result = score_with_repeats(
-            egfr_csv, n_va=50, n_repeats=3, random_state=42, paper_mode=True
+            egfr_csv, n_va=50, n_repeats=3, random_state=42
         )
         for r in result["repeats"]:
-            for score in ("C", "D", "S", "P"):
+            for score in ("C", "D", "S"):
                 assert 0.0 <= r[score] <= 1.0, f"{score}={r[score]} out of [0,1]"
+            assert np.isfinite(r["P"]) or r["P"] == 0.0
+            assert r["P"] >= 0.0, f"P={r['P']} is negative"
 
     def test_reproducible(self, egfr_csv):
-        r1 = score_with_repeats(egfr_csv, n_va=30, n_repeats=3, random_state=7, paper_mode=True)
-        r2 = score_with_repeats(egfr_csv, n_va=30, n_repeats=3, random_state=7, paper_mode=True)
+        r1 = score_with_repeats(egfr_csv, n_va=30, n_repeats=3, random_state=7)
+        r2 = score_with_repeats(egfr_csv, n_va=30, n_repeats=3, random_state=7)
         assert r1["C_mean"] == pytest.approx(r2["C_mean"], abs=1e-9)
         assert r1["S_mean"] == pytest.approx(r2["S_mean"], abs=1e-9)
 
     def test_different_seeds_differ(self, egfr_csv):
-        r1 = score_with_repeats(egfr_csv, n_va=50, n_repeats=4, random_state=1, paper_mode=True)
-        r2 = score_with_repeats(egfr_csv, n_va=50, n_repeats=4, random_state=99, paper_mode=True)
-        # Different seeds should produce different results in general
-        # (may occasionally be equal for trivial cases, so just check structure)
+        r1 = score_with_repeats(egfr_csv, n_va=50, n_repeats=4, random_state=1)
+        r2 = score_with_repeats(egfr_csv, n_va=50, n_repeats=4, random_state=99)
         assert len(r1["repeats"]) == len(r2["repeats"])
 
     def test_settings_recorded(self, egfr_csv):
         result = score_with_repeats(
-            egfr_csv, n_va=100, n_repeats=2, random_state=42, paper_mode=True
+            egfr_csv, n_va=100, n_repeats=2, random_state=42
         )
         s = result["settings"]
         assert s["n_va"] == 100
         assert s["n_repeats"] == 2
         assert s["random_state"] == 42
-        assert s["paper_mode"] is True
-
-    def test_legacy_mode_runs(self, egfr_csv):
-        result = score_with_repeats(
-            egfr_csv, n_va=30, n_repeats=2, paper_mode=False
-        )
-        assert len(result["repeats"]) == 2
 
     def test_stage_labels_valid(self, egfr_csv):
         result = score_with_repeats(
-            egfr_csv, n_va=30, n_repeats=3, random_state=42, paper_mode=True
+            egfr_csv, n_va=30, n_repeats=3, random_state=42
         )
         valid_stages = {"early", "early_mid", "mid", "late"}
         for r in result["repeats"]:

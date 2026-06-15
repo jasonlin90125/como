@@ -88,6 +88,13 @@ class TestDecomposeSeries:
         smiles = [r[0] for r in _EAS_2S]
         decomp = decompose_series(_CORE_2S, smiles)
         hacs = [r.heavy_atom_count for r in decomp.ea_records]
+        # Default hac_padding=0: exact EA range
+        assert decomp.ea_hac_range == (min(hacs), max(hacs))
+
+    def test_hac_range_with_padding(self):
+        smiles = [r[0] for r in _EAS_2S]
+        decomp = decompose_series(_CORE_2S, smiles, hac_padding=3)
+        hacs = [r.heavy_atom_count for r in decomp.ea_records]
         assert decomp.ea_hac_range == (min(hacs) - 3, max(hacs) + 3)
 
     def test_substitution_probability(self):

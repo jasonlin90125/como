@@ -63,16 +63,11 @@ Examples:
     parser.add_argument("--svr-epsilon", type=float, default=0.1,
                         help="SVR epsilon [default: 0.1]")
 
-    # --- Paper-mode and reproducibility flags ---
-    paper = parser.add_argument_group("Paper-mode options")
-    paper.add_argument(
-        "--paper-mode", action="store_true", default=False,
-        help="Enable paper-aligned random H-aware close-in VA generation and "
-             "context-fixed FW neighborhood counting.",
-    )
+    # --- Reproducibility ---
+    paper = parser.add_argument_group("Reproducibility options")
     paper.add_argument(
         "--random-state", type=int, default=42,
-        help="Random seed for paper-mode VA generation and SVR splits [default: 42].",
+        help="Random seed for VA generation and SVR splits [default: 42].",
     )
 
     # --- Diagnostic scoring protocol ---
@@ -145,40 +140,11 @@ def main(argv: list[str] | None = None) -> int:
             random_state=args.random_state,
             s_threshold=args.s_threshold,
             p_threshold=args.p_threshold,
-            paper_mode=args.paper_mode,
         )
         return 0
 
     # --- Standard single-run pipeline ---
     from .scoring import score_series
-    from .analogs.close_in import CloseInVAGenerator
-    from .analogs.free_wilson import FreeWilsonVAGenerator
-    from .analogs.diverse import DiverseVAGenerator
-
-    # Pass paper_mode flags via kwargs for generators that accept them
-    ci_gen = CloseInVAGenerator(
-        paper_mode=args.paper_mode,
-        random_state=args.random_state,
-    )
-
-    # Load external actives for paper SVR
-    external_smiles: list[str] | None = None
-    external_activities = None
-    if args.svr_mode == "paper" and args.external_actives:
-        import polars as pl
-        ext_df = pl.read_csv(args.external_actives)
-        if "smiles" in ext_df.columns and args.external_activity_col in ext_df.columns:
-            ext_df = ext_df.drop_nulls(subset=["smiles", args.external_activity_col])
-            external_smiles = ext_df["smiles"].to_list()
-            import numpy as np
-            external_activities = np.array(ext_df[args.external_activity_col].to_list())
-        else:
-            print(
-                f"Error: --external-actives CSV must have 'smiles' and "
-                f"'{args.external_activity_col}' columns.",
-                file=sys.stderr,
-            )
-            return 1
 
     score_series(
         series_csv=args.series,
@@ -196,7 +162,12 @@ def main(argv: list[str] | None = None) -> int:
         svr_c=args.svr_c,
         svr_epsilon=args.svr_epsilon,
         fragment_lib=args.fragment_lib,
-        paper_mode=args.paper_mode,
         random_state=args.random_state,
+        svr_mode=args.svr_mode,
+        external_actives_csv=args.external_actives,
+        external_activity_col=args.external_activity_col,
+        ea_train_fraction=args.ea_train_fraction,
+        outer_folds=args.outer_folds,
+        inner_folds=args.inner_folds,
     )
     return 0
